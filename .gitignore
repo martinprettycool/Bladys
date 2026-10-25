@@ -4,5 +4,8 @@ build/
 dist/
 wheels/
 *.egg-info
-
-.venv
+.venv/
+.pytest_cache/
+.env
+.env.*
+!.env.example
