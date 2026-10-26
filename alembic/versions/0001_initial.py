@@ -28,8 +28,7 @@ def upgrade():
         sa.Column("status", sa.String(20), nullable=False, server_default="PENDIENTE_ACEPTACION"),
         sa.Column("total", sa.Numeric(12, 2), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-        sa.CheckConstraint("total >= 0", name="ck_orders_total_nonnegative"),
-        sa.CheckConstraint("status = 'PENDIENTE_ACEPTACION'", name="ck_orders_status"),
+        sa.CheckConstraint("total >= 0", name="ck_orders_total_nonnegative")
     )
     op.create_table(
         "order_items",
