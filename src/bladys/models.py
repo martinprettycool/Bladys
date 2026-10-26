@@ -66,6 +66,25 @@ class Order(Base):
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order", passive_deletes="all",
     )
+    idempotency_records: Mapped[list["IdempotencyRecord"]] = relationship(
+        back_populates="order", passive_deletes="all",
+    )
+
+
+class IdempotencyRecord(Base):
+    __tablename__ = "idempotency_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("orders.id", ondelete="RESTRICT"), nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    order: Mapped[Order] = relationship(back_populates="idempotency_records")
 
 
 class OrderItem(Base):

@@ -33,7 +33,7 @@ def assert_no_orders(engine):
 
 def test_create_order_consolidates_and_snapshots_prices(order_client, engine):
     client = order_client
-    response = client.post("/orders", json={"items": [
+    response = client.post("/orders", headers={"Idempotency-Key": "consolidates-prices"}, json={"items": [
         {"variant_id": 10, "quantity": 2},
         {"variant_id": 11, "quantity": 1},
         {"variant_id": 10, "quantity": 3},
@@ -63,7 +63,7 @@ def test_create_order_consolidates_and_snapshots_prices(order_client, engine):
 @pytest.mark.parametrize("variant_id, status", [(999, 404), (12, 400), (20, 400)])
 def test_invalid_variant_leaves_no_order(order_client, engine, variant_id, status):
     client = order_client
-    response = client.post("/orders", json={"items": [
+    response = client.post("/orders", headers={"Idempotency-Key": "invalid-variant"}, json={"items": [
         {"variant_id": 10, "quantity": 1},
         {"variant_id": variant_id, "quantity": 1},
     ]})
@@ -86,7 +86,7 @@ def test_invalid_variant_leaves_no_order(order_client, engine, variant_id, statu
 ])
 def test_invalid_request_is_rejected(order_client, engine, payload):
     client = order_client
-    assert client.post("/orders", json=payload).status_code == 422
+    assert client.post("/orders", headers={"Idempotency-Key": "invalid-request"}, json=payload).status_code == 422
     assert_no_orders(engine)
 
 
@@ -104,7 +104,7 @@ def test_item_insert_failure_rolls_back_entire_order(order_client, engine):
     event.listen(OrderItem, "before_insert", fail_item)
     try:
         with pytest.raises(RuntimeError, match="simulated item insert failure"):
-            client.post("/orders", json={"items": [{"variant_id": 10, "quantity": 2}]})
+            client.post("/orders", headers={"Idempotency-Key": "item-insert-failure"}, json={"items": [{"variant_id": 10, "quantity": 2}]})
     finally:
         event.remove(Order, "after_insert", record_order)
         event.remove(OrderItem, "before_insert", fail_item)
@@ -133,7 +133,7 @@ def test_order_uses_current_database_price(client, session):
     variant.price = Decimal("4.00")
     session.commit()
     # ACT
-    response = client.post("/orders", json = {"items": [{"variant_id": 10, "quantity" : 2 }]})
+    response = client.post("/orders", headers={"Idempotency-Key": "current-database-price"}, json = {"items": [{"variant_id": 10, "quantity" : 2 }]})
     assert response.status_code == 201
     # ASSERT
     item = session.scalar(select(OrderItem).where(OrderItem.variant_id == 10))

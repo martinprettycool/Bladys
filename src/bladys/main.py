@@ -1,12 +1,15 @@
 from decimal import Decimal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Header
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from bladys.database import get_session
-from bladys.models import Order, OrderItem, Product, ProductVariant
+from bladys.models import Order, OrderItem, Product, ProductVariant, IdempotencyRecord
 from bladys.schemas import OrderCreate, OrderResponse, ProductResponse
+import hashlib
+import json
+from bladys.idempotency import build_request_hash
 
 app = FastAPI()
 
@@ -27,13 +30,31 @@ def get_products(session: Session = Depends(get_session)):
 
 
 @app.post("/orders", response_model=OrderResponse, status_code=201)
-def create_order(payload: OrderCreate, session: Session = Depends(get_session)):
+def create_order(payload: OrderCreate, session: Session = Depends(get_session), idempotency_key: str =Header(...,alias="Idempotency-Key")):
     # Type hint para que tipo de datos va entrar dentro del dict 
     quantities: dict[int, int] = {}
     for item in payload.items:
         quantities[item.variant_id] = quantities.get(item.variant_id, 0) + item.quantity
-
+    hash_intention = build_request_hash(quantities=quantities)
     with session.begin():
+        stmt = select(IdempotencyRecord).where(IdempotencyRecord.key == idempotency_key)
+        existing_record = session.scalar(stmt)
+        if existing_record:
+            if existing_record.request_hash == hash_intention:
+                #retry
+                retry_order = session.get(Order, existing_record.order_id)
+                response = OrderResponse(
+                    id = retry_order.id,
+                    status= retry_order.status,
+                    total= retry_order.total,
+                    items = retry_order.items
+                )
+                return response
+            else:
+                raise HTTPException(409, detail='conflict')
+        
+
+
         statement = (
             select(ProductVariant, Product.is_available)
             .join(ProductVariant.product)
@@ -68,6 +89,12 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session)):
         )
         session.add(order)
         session.flush()
+        idempotency_record = IdempotencyRecord(
+            key = idempotency_key,
+            request_hash = hash_intention,
+            order_id = order.id
+        )
+        session.add(idempotency_record)
         response = OrderResponse.model_validate(order)
 
     return response
