@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from fastapi import Depends, FastAPI, HTTPException, Header
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
@@ -31,12 +31,47 @@ def get_products(session: Session = Depends(get_session)):
     return session.scalars(statement).all()
 
 
-@app.post("/orders", response_model=OrderResponse, status_code=201)
-def create_order(payload: OrderCreate, session: Session = Depends(get_session), idempotency_key: str =Header(...,alias="Idempotency-Key")):
-    # Type hint para que tipo de datos va entrar dentro del dict 
+def normalize_items(payload: OrderCreate) -> dict[int, int]:
     quantities: dict[int, int] = {}
     for item in payload.items:
         quantities[item.variant_id] = quantities.get(item.variant_id, 0) + item.quantity
+    return quantities
+
+
+def build_order_items(session: Session, quantities: dict[int, int]):
+    statement = (
+        select(ProductVariant, Product.is_available)
+        .join(ProductVariant.product)
+        .where(ProductVariant.id.in_(quantities))
+    )
+    variants = {
+        variant.id: (variant, product_available)
+        for variant, product_available in session.execute(statement)
+    }
+
+    order_items = []
+    total = Decimal("0.00")
+    for variant_id, quantity in quantities.items():
+        if variant_id not in variants:
+            raise HTTPException(404, detail=f"La variante {variant_id} no existe")
+
+        variant, product_available = variants[variant_id]
+        if not variant.is_available or not product_available:
+            raise HTTPException(400, detail=f"La variante {variant_id} no esta disponible")
+
+        order_items.append(OrderItem(
+            variant_id=variant_id,
+            quantity=quantity,
+            unit_price=variant.price,
+        ))
+        total += variant.price * quantity
+
+    return order_items, total
+
+
+@app.post("/orders", response_model=OrderResponse, status_code=201)
+def create_order(payload: OrderCreate, session: Session = Depends(get_session), idempotency_key: str =Header(...,alias="Idempotency-Key")):
+    quantities = normalize_items(payload)
     hash_intention = build_request_hash(quantities=quantities)
     try:
         with session.begin():
@@ -58,32 +93,7 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
         
 
 
-            statement = (
-                select(ProductVariant, Product.is_available)
-                .join(ProductVariant.product)
-                .where(ProductVariant.id.in_(quantities))
-            )
-            variants = {
-                variant.id: (variant, product_available)
-                for variant, product_available in session.execute(statement)
-            }
-
-            order_items = []
-            total = Decimal("0.00")
-            for variant_id, quantity in quantities.items():
-                if variant_id not in variants:
-                    raise HTTPException(404, detail=f"La variante {variant_id} no existe")
-
-                variant, product_available = variants[variant_id]
-                if not variant.is_available or not product_available:
-                    raise HTTPException(400, detail=f"La variante {variant_id} no esta disponible")
-
-                order_items.append(OrderItem(
-                    variant_id=variant_id,
-                    quantity=quantity,
-                    unit_price=variant.price,
-                ))
-                total += variant.price * quantity
+            order_items, total = build_order_items(session, quantities)
 
             order = Order(
                 status="PENDIENTE_ACEPTACION",
@@ -112,6 +122,34 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
         order = session.get(Order, existing_record.order_id)
         response = OrderResponse.model_validate(order)
 
+    return response
+
+
+@app.put("/orders/{order_id}/items", response_model=OrderResponse)
+def replace_order_items(
+    order_id: int,
+    payload: OrderCreate,
+    session: Session = Depends(get_session),
+):
+    with session.begin():
+        # Lock before inspecting status; the kitchen UPDATE takes the same row lock.
+        order = session.scalar(
+            select(Order).where(Order.id == order_id).with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if order is None:
+            raise HTTPException(404, detail="El pedido no existe")
+        if order.status != "PENDIENTE_ACEPTACION":
+            raise HTTPException(409, detail="El pedido ya no permite modificar items")
+
+        items, total = build_order_items(session, normalize_items(payload))
+        session.execute(delete(OrderItem).where(OrderItem.order_id == order_id))
+        # Explicit deletion is needed: this relationship has no delete-orphan cascade.
+        session.expire(order, ["items"])
+        order.items = items
+        order.total = total
+        session.flush()
+        response = OrderResponse.model_validate(order)
     return response
 
 

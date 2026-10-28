@@ -220,3 +220,100 @@ def test_postgres_rejects_unsupported_order_status(postgres_session):
         postgres_session.commit()
     assert caught.value.orig.diag.constraint_name == "ck_orders_status"
     postgres_session.rollback()
+
+
+@pytest.mark.parametrize("winner", ["modification", "kitchen"])
+def test_replacement_vs_preparation_row_lock(
+    postgres_client, postgres_engine, postgres_session, postgres_order_variant_id, winner,
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from time import monotonic, sleep
+
+    from sqlalchemy import event, text
+    from sqlalchemy.orm import Session
+
+    assert postgres_engine.dialect.name == "postgresql"
+    created = postgres_client.post(
+        "/orders", headers={"Idempotency-Key": "replacement-race"},
+        json={"items": [{"variant_id": postgres_order_variant_id, "quantity": 2}]},
+    )
+    assert created.status_code == 201
+    order_id = created.json()["id"]
+    postgres_session.rollback()
+    acquired = Event()
+    release = Event()
+    contender_started = Event()
+    pids = {}
+
+    def operation(context):
+        statement = context.compiled.statement if context.compiled else None
+        if context.isupdate and statement.table.name == "orders":
+            # Only PATCH writes status; PUT's later total UPDATE is irrelevant.
+            if "status" in context.compiled_parameters[0]:
+                return "kitchen"
+        if statement is not None and getattr(statement, "is_select", False):
+            if getattr(statement, "_for_update_arg", None) is not None:
+                return "modification"
+        return None
+
+    def before_execute(connection, cursor, statement, parameters, context, executemany):
+        role = operation(context)
+        if role:
+            pids[role] = connection.connection.driver_connection.info.backend_pid
+            if role != winner:
+                contender_started.set()
+
+    def after_execute(connection, cursor, statement, parameters, context, executemany):
+        if operation(context) == winner:
+            # The real lock/UPDATE has completed, but its transaction cannot commit yet.
+            acquired.set()
+            assert release.wait(15), "Timed out releasing winning transaction"
+
+    def modify():
+        return postgres_client.put(f"/orders/{order_id}/items", json={"items": [
+            {"variant_id": postgres_order_variant_id, "quantity": 5}
+        ]})
+
+    def prepare():
+        return postgres_client.patch(f"/orders/{order_id}/status", json={"status": "PREPARANDO"})
+
+    event.listen(postgres_engine, "before_cursor_execute", before_execute)
+    event.listen(postgres_engine, "after_cursor_execute", after_execute)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                first = executor.submit(modify if winner == "modification" else prepare)
+                assert acquired.wait(10)
+                second = executor.submit(prepare if winner == "modification" else modify)
+                assert contender_started.wait(10)
+                loser = "kitchen" if winner == "modification" else "modification"
+                assert pids[winner] != pids[loser]
+                # Prove real PostgreSQL blocking, not just overlapping Python threads.
+                deadline = monotonic() + 10
+                with postgres_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as observer:
+                    while True:
+                        blockers = observer.scalar(text("SELECT pg_blocking_pids(:pid)"), {"pid": pids[loser]})
+                        if pids[winner] in blockers:
+                            break
+                        assert monotonic() < deadline, "Competing request did not block on winner"
+                        sleep(0.01)
+            finally:
+                release.set()
+            first_response = first.result(timeout=20)
+            second_response = second.result(timeout=20)
+    finally:
+        event.remove(postgres_engine, "before_cursor_execute", before_execute)
+        event.remove(postgres_engine, "after_cursor_execute", after_execute)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == (200 if winner == "modification" else 409)
+    with Session(postgres_engine) as verification:
+        persisted = verification.get(Order, order_id)
+        assert persisted.status == "PREPARANDO"
+        quantity = 5 if winner == "modification" else 2
+        assert persisted.total == Decimal("3.00") * quantity
+        assert [(i.variant_id, i.quantity, i.unit_price) for i in persisted.items] == [
+            (postgres_order_variant_id, quantity, Decimal("3.00"))
+        ]
+
