@@ -52,6 +52,11 @@ class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
         CheckConstraint("total >= 0", name="ck_orders_total_nonnegative"),
+        CheckConstraint(
+            "status IN ('PENDIENTE_ACEPTACION', 'PREPARANDO', 'LISTO', "
+            "'ENVIADO', 'RECHAZADO', 'CANCELADO')",
+            name="ck_orders_status",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

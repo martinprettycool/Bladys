@@ -141,3 +141,82 @@ def test_concurrent_same_key_and_intent_returns_same_order(
         assert record.order_id == order_id
         assert record.key == key
         assert record.request_hash == build_request_hash({postgres_order_variant_id: 2})
+
+
+def test_concurrent_cancellation_and_preparation_only_one_wins(
+    postgres_client, postgres_engine, postgres_session,
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+
+    from sqlalchemy import event, select
+    from sqlalchemy.orm import Session
+
+    assert postgres_engine.dialect.name == "postgresql"
+    order = Order(total=Decimal("0.00"))
+    postgres_session.add(order)
+    postgres_session.commit()
+    order_id = order.id
+    postgres_session.rollback()
+
+    both_pending = Barrier(2, timeout=10)
+    lock = Lock()
+    observations = []
+    rowcounts = []
+
+    def before_update(connection, cursor, statement, parameters, context, executemany):
+        if not context.isupdate or context.compiled.statement.table.name != "orders":
+            return
+        # Both independent PostgreSQL transactions actually observe pending
+        # before either UPDATE is sent. The SELECT is test instrumentation only.
+        status = connection.scalar(select(Order.status).where(Order.id == order_id))
+        with lock:
+            observations.append((connection.connection.driver_connection.info.backend_pid, status))
+        both_pending.wait()
+
+    def after_update(connection, cursor, statement, parameters, context, executemany):
+        if context.isupdate and context.compiled.statement.table.name == "orders":
+            with lock:
+                rowcounts.append(cursor.rowcount)
+
+    def transition(target):
+        return postgres_client.patch(
+            f"/orders/{order_id}/status", json={"status": target},
+        )
+
+    event.listen(postgres_engine, "before_cursor_execute", before_update)
+    event.listen(postgres_engine, "after_cursor_execute", after_update)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            targets = ("CANCELADO", "PREPARANDO")
+            futures = [executor.submit(transition, target) for target in targets]
+            responses = [future.result(timeout=30) for future in futures]
+    finally:
+        event.remove(postgres_engine, "before_cursor_execute", before_update)
+        event.remove(postgres_engine, "after_cursor_execute", after_update)
+
+    assert len(observations) == 2
+    assert observations[0][0] != observations[1][0]
+    assert [status for _, status in observations] == ["PENDIENTE_ACEPTACION"] * 2
+    assert sorted(rowcounts) == [0, 1]
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    winner = next(target for target, response in zip(targets, responses) if response.status_code == 200)
+    loser = next(response for response in responses if response.status_code == 409)
+    assert winner in loser.json()["detail"]
+    with Session(postgres_engine) as verification:
+        persisted = verification.get(Order, order_id)
+        assert persisted.status in {"CANCELADO", "PREPARANDO"}
+        assert persisted.status == winner
+    for target, response in zip(targets, responses):
+        if response.status_code == 200:
+            assert response.json()["status"] == target
+
+
+def test_postgres_rejects_unsupported_order_status(postgres_session):
+    from sqlalchemy.exc import IntegrityError
+
+    postgres_session.add(Order(status="ENTREGADO", total=Decimal("0.00")))
+    with pytest.raises(IntegrityError) as caught:
+        postgres_session.commit()
+    assert caught.value.orig.diag.constraint_name == "ck_orders_status"
+    postgres_session.rollback()

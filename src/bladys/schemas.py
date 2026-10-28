@@ -2,6 +2,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from bladys.order_lifecycle import OrderStatus
+
 
 class ProductVariantResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -41,10 +43,16 @@ class OrderItemResponse(BaseModel):
     unit_price: Decimal
 
 
+class OrderStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: OrderStatus
+
+
 class OrderResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    status: str
+    status: OrderStatus
     total: Decimal
     items: list[OrderItemResponse]

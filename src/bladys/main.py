@@ -1,13 +1,14 @@
 from decimal import Decimal
 
 from fastapi import Depends, FastAPI, HTTPException, Header
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
 from bladys.database import get_session
 from bladys.models import Order, OrderItem, Product, ProductVariant, IdempotencyRecord
-from bladys.schemas import OrderCreate, OrderResponse, ProductResponse
+from bladys.schemas import OrderCreate, OrderResponse, OrderStatusUpdate, ProductResponse
+from bladys.order_lifecycle import EXPECTED_STATUS
 import hashlib
 import json
 from bladys.idempotency import build_request_hash
@@ -111,4 +112,47 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
         order = session.get(Order, existing_record.order_id)
         response = OrderResponse.model_validate(order)
 
+    return response
+
+
+@app.patch("/orders/{order_id}/status", response_model=OrderResponse)
+def update_order_status(
+    order_id: int,
+    payload: OrderStatusUpdate,
+    session: Session = Depends(get_session),
+):
+    """Advance kitchen status, or request customer cancellation with CANCELADO.
+
+    Cancellation is allowed only before kitchen acceptance. No authentication
+    or actor permissions are enforced by this MVP endpoint.
+    """
+    expected_status = EXPECTED_STATUS.get(payload.status)
+    with session.begin():
+        updated = 0
+        if expected_status is not None:
+            # Check and write in one statement: competing transitions cannot
+            # both consume the same predecessor, even if both saw it earlier.
+            result = session.execute(
+                update(Order)
+                .where(Order.id == order_id, Order.status == expected_status)
+                .values(status=payload.status)
+                .execution_options(synchronize_session=False)
+            )
+            updated = result.rowcount
+
+        # Read fresh database state after the attempt, including on a lost race.
+        order = session.scalar(
+            select(Order)
+            .where(Order.id == order_id)
+            .options(selectinload(Order.items))
+            .execution_options(populate_existing=True)
+        )
+        if order is None:
+            raise HTTPException(404, detail="El pedido no existe")
+        if updated == 0:
+            raise HTTPException(
+                409,
+                detail=f"Transicion no permitida: {order.status} -> {payload.status}",
+            )
+        response = OrderResponse.model_validate(order)
     return response
