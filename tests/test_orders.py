@@ -8,7 +8,7 @@ from bladys.models import Order, OrderItem, Product, ProductVariant
 
 
 @pytest.fixture
-def order_client(client, session):
+def seeded_order_client(client, session):
     session.add(Product(
         id=1, name="Pizza", is_available=True,
         variants=[
@@ -31,8 +31,8 @@ def assert_no_orders(engine):
         assert session.scalar(select(func.count()).select_from(OrderItem)) == 0
 
 
-def test_create_order_consolidates_and_snapshots_prices(order_client, engine):
-    client = order_client
+def test_create_order_consolidates_and_snapshots_prices(seeded_order_client, engine):
+    client = seeded_order_client
     response = client.post("/orders", headers={"Idempotency-Key": "consolidates-prices"}, json={"items": [
         {"variant_id": 10, "quantity": 2},
         {"variant_id": 11, "quantity": 1},
@@ -61,8 +61,8 @@ def test_create_order_consolidates_and_snapshots_prices(order_client, engine):
 
 
 @pytest.mark.parametrize("variant_id, status", [(999, 404), (12, 400), (20, 400)])
-def test_invalid_variant_leaves_no_order(order_client, engine, variant_id, status):
-    client = order_client
+def test_invalid_variant_leaves_no_order(seeded_order_client, engine, variant_id, status):
+    client = seeded_order_client
     response = client.post("/orders", headers={"Idempotency-Key": "invalid-variant"}, json={"items": [
         {"variant_id": 10, "quantity": 1},
         {"variant_id": variant_id, "quantity": 1},
@@ -84,14 +84,14 @@ def test_invalid_variant_leaves_no_order(order_client, engine, variant_id, statu
     {"items": [{"variant_id": 10, "quantity": 1}], "status": "PAGADO"},
     {"items": [{"variant_id": 10, "quantity": 1}], "is_available": True},
 ])
-def test_invalid_request_is_rejected(order_client, engine, payload):
-    client = order_client
+def test_invalid_request_is_rejected(seeded_order_client, engine, payload):
+    client = seeded_order_client
     assert client.post("/orders", headers={"Idempotency-Key": "invalid-request"}, json=payload).status_code == 422
     assert_no_orders(engine)
 
 
-def test_item_insert_failure_rolls_back_entire_order(order_client, engine):
-    client = order_client
+def test_item_insert_failure_rolls_back_entire_order(seeded_order_client, engine):
+    client = seeded_order_client
     inserted_orders = []
 
     def record_order(mapper, connection, target):
@@ -112,31 +112,20 @@ def test_item_insert_failure_rolls_back_entire_order(order_client, engine):
     assert len(inserted_orders) == 1
     assert_no_orders(engine)
 
-def test_order_uses_current_database_price(client, session):
+def test_order_uses_current_database_price(client, session, product_factory, variant_factory):
     # PREPARE
-    product = Product(
-        id=1,
-        name="Pizza",
-        is_available=True,
-        variants=[
-            ProductVariant(
-                id=10,
-                name="Personal",
-                price=Decimal("3.00"),
-                is_available=True,
-            )
-        ],
-    )
+    variant = variant_factory()
+    product = product_factory(variants=[variant])
     session.add(product)
     session.commit()
-    variant = session.get(ProductVariant, 10)
     variant.price = Decimal("4.00")
     session.commit()
+
     # ACT
-    response = client.post("/orders", headers={"Idempotency-Key": "current-database-price"}, json = {"items": [{"variant_id": 10, "quantity" : 2 }]})
+    response = client.post("/orders", headers={"Idempotency-Key": "current-database-price"}, json = {"items": [{"variant_id": variant.id, "quantity" : 2 }]})
     assert response.status_code == 201
     # ASSERT
-    item = session.scalar(select(OrderItem).where(OrderItem.variant_id == 10))
+    item = session.scalar(select(OrderItem).where(OrderItem.variant_id == variant.id))
     assert item.unit_price == Decimal("4.00")
     body = response.json()
     order = session.get(Order, body['id'])

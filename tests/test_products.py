@@ -1,12 +1,16 @@
 from decimal import Decimal
 
 from bladys.models import Product, ProductVariant
+import pytest
 
 
 def test_empty_catalog(client):
     response = client.get("/products")
     assert response.status_code == 200
     assert response.json() == []
+
+
+
 
 
 def test_available_products_and_variants(client, session):
