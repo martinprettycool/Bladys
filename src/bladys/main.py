@@ -6,8 +6,11 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
 from bladys.database import get_session
-from bladys.models import Order, OrderItem, Product, ProductVariant, IdempotencyRecord
-from bladys.schemas import OrderCreate, OrderResponse, OrderStatusUpdate, ProductResponse
+from bladys.models import Payment, Order, OrderItem, Product, ProductVariant, IdempotencyRecord
+from bladys.schemas import (
+    PaymentProofSubmission, PaymentDecision, PaymentResponse,
+    OrderCreate, OrderResponse, OrderStatusUpdate, ProductResponse,
+)
 from bladys.order_lifecycle import EXPECTED_STATUS
 import hashlib
 import json
@@ -99,6 +102,7 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
                 status="PENDIENTE_ACEPTACION",
                 total=total,
                 items=order_items,
+                payment=Payment(),
             )
             session.add(order)
             session.flush()
@@ -170,9 +174,14 @@ def update_order_status(
         if expected_status is not None:
             # Check and write in one statement: competing transitions cannot
             # both consume the same predecessor, even if both saw it earlier.
+            conditions = [Order.id == order_id, Order.status == expected_status]
+            if payload.status == "PREPARANDO":
+                conditions.append(select(Payment.id).where(
+                    Payment.order_id == Order.id, Payment.status == "APROBADO",
+                ).exists())
             result = session.execute(
                 update(Order)
-                .where(Order.id == order_id, Order.status == expected_status)
+                .where(*conditions)
                 .values(status=payload.status)
                 .execution_options(synchronize_session=False)
             )
@@ -193,4 +202,65 @@ def update_order_status(
                 detail=f"Transicion no permitida: {order.status} -> {payload.status}",
             )
         response = OrderResponse.model_validate(order)
+    return response
+
+@app.get("/kitchen/orders/pending", response_model=list[OrderResponse])
+def kitchen_pending_orders(session: Session = Depends(get_session)):
+    return session.scalars(
+        select(Order).join(Payment).where(
+            Order.status == "PENDIENTE_ACEPTACION", Payment.status == "APROBADO",
+        ).options(selectinload(Order.items)).order_by(Order.id)
+    ).all()
+
+
+@app.post("/orders/{order_id}/payment/proof", response_model=PaymentResponse)
+def submit_payment_proof(
+    order_id: int, payload: PaymentProofSubmission,
+    session: Session = Depends(get_session),
+):
+    with session.begin():
+        result = session.execute(
+            update(Payment).where(
+                Payment.order_id == order_id, Payment.status == "PENDIENTE_COMPROBANTE",
+            ).values(status="PENDIENTE_VERIFICACION", proof_reference=payload.proof_reference)
+            .execution_options(synchronize_session=False)
+        )
+        payment = session.scalar(select(Payment).where(Payment.order_id == order_id)
+                                 .execution_options(populate_existing=True))
+        if payment is None:
+            raise HTTPException(404, detail="El pago no existe")
+        if result.rowcount != 1:
+            raise HTTPException(409, detail="El pago no permite enviar comprobante")
+        response = PaymentResponse.model_validate(payment)
+    return response
+
+
+@app.get("/payments/pending", response_model=list[PaymentResponse])
+def payments_pending_verification(session: Session = Depends(get_session)):
+    return session.scalars(select(Payment).where(
+        Payment.status == "PENDIENTE_VERIFICACION",
+    ).order_by(Payment.id)).all()
+
+
+@app.patch("/payments/{payment_id}/status", response_model=PaymentResponse)
+def decide_payment(
+    payment_id: int, payload: PaymentDecision,
+    session: Session = Depends(get_session),
+):
+    with session.begin():
+        result = session.execute(
+            update(Payment).where(
+                Payment.id == payment_id, Payment.status == "PENDIENTE_VERIFICACION",
+            ).values(status=payload.status).execution_options(synchronize_session=False)
+        )
+        payment = session.scalar(select(Payment).where(Payment.id == payment_id)
+                                 .execution_options(populate_existing=True))
+        if payment is None:
+            raise HTTPException(404, detail="El pago no existe")
+        if result.rowcount != 1:
+            raise HTTPException(409, detail="El pago no permite esta decision")
+        if payload.status == "RECHAZADO":
+            session.execute(update(Order).where(Order.id == payment.order_id)
+                            .values(status="CANCELADO").execution_options(synchronize_session=False))
+        response = PaymentResponse.model_validate(payment)
     return response

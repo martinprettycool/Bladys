@@ -71,6 +71,9 @@ class Order(Base):
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order", passive_deletes="all",
     )
+    payment: Mapped["Payment | None"] = relationship(
+        back_populates="order", passive_deletes="all",
+    )
     idempotency_records: Mapped[list["IdempotencyRecord"]] = relationship(
         back_populates="order", passive_deletes="all",
     )
@@ -111,3 +114,22 @@ class OrderItem(Base):
 
     order: Mapped[Order] = relationship(back_populates="items")
     variant: Mapped[ProductVariant] = relationship(back_populates="items")
+
+class Payment(Base):
+    __tablename__ = "payments"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDIENTE_COMPROBANTE', 'PENDIENTE_VERIFICACION', 'APROBADO', 'RECHAZADO')",
+            name="ck_payments_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("orders.id", ondelete="RESTRICT"), nullable=False, unique=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, server_default="PENDIENTE_COMPROBANTE",
+    )
+    proof_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    order: Mapped[Order] = relationship(back_populates="payment")

@@ -1,5 +1,5 @@
 import pytest
-from bladys.models import Product, ProductVariant, Order
+from bladys.models import Payment, Product, ProductVariant, Order
 from decimal import Decimal 
 
 @pytest.fixture
@@ -134,6 +134,7 @@ def test_concurrent_same_key_and_intent_returns_same_order(
         order = verification_session.scalars(select(Order)).one()
         item = verification_session.scalars(select(OrderItem)).one()
         record = verification_session.scalars(select(IdempotencyRecord)).one()
+        assert verification_session.scalars(select(Payment)).one().order_id == order_id
         assert order.id == order_id
         assert item.order_id == order_id
         assert item.variant_id == postgres_order_variant_id
@@ -153,7 +154,7 @@ def test_concurrent_cancellation_and_preparation_only_one_wins(
     from sqlalchemy.orm import Session
 
     assert postgres_engine.dialect.name == "postgresql"
-    order = Order(total=Decimal("0.00"))
+    order = Order(total=Decimal("0.00"), payment=Payment(status="APROBADO"))
     postgres_session.add(order)
     postgres_session.commit()
     order_id = order.id
@@ -240,6 +241,8 @@ def test_replacement_vs_preparation_row_lock(
     )
     assert created.status_code == 201
     order_id = created.json()["id"]
+    postgres_session.query(Payment).filter_by(order_id=order_id).update({"status": "APROBADO"})
+    postgres_session.commit()
     postgres_session.rollback()
     acquired = Event()
     release = Event()
@@ -317,3 +320,108 @@ def test_replacement_vs_preparation_row_lock(
             (postgres_order_variant_id, quantity, Decimal("3.00"))
         ]
 
+
+
+@pytest.mark.parametrize("approval_commits_first", [False, True])
+def test_approval_vs_preparation_committed_visibility(
+    postgres_client, postgres_engine, postgres_session, approval_commits_first,
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session
+
+    assert postgres_engine.dialect.name == "postgresql"
+    order = Order(total=Decimal("0.00"), payment=Payment(
+        status="PENDIENTE_VERIFICACION", proof_reference="opaque:proof",
+    ))
+    postgres_session.add(order)
+    postgres_session.commit()
+    order_id, payment_id = order.id, order.payment.id
+    postgres_session.rollback()
+    approval_updated = Event()
+    release_approval = Event()
+    pids = {}
+
+    def hold_approval(connection, cursor, statement, parameters, context, executemany):
+        if context.isupdate:
+            table = context.compiled.statement.table.name
+            pids[table] = connection.connection.driver_connection.info.backend_pid
+            if table == "payments":
+                # Real UPDATE completed; APROBADO is still uncommitted.
+                approval_updated.set()
+                assert release_approval.wait(15)
+
+    def prepare():
+        return postgres_client.patch(f"/orders/{order_id}/status", json={"status": "PREPARANDO"})
+
+    event.listen(postgres_engine, "after_cursor_execute", hold_approval)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            try:
+                approval = executor.submit(postgres_client.patch,
+                    f"/payments/{payment_id}/status", json={"status": "APROBADO"})
+                assert approval_updated.wait(10)
+                if approval_commits_first:
+                    release_approval.set()
+                    assert approval.result(timeout=10).status_code == 200
+                preparation = executor.submit(prepare).result(timeout=10)
+                assert preparation.status_code == (200 if approval_commits_first else 409)
+                if not approval_commits_first:
+                    assert pids["payments"] != pids["orders"]
+                # Independent connection sees committed state while approval is held.
+                with Session(postgres_engine) as verification:
+                    assert verification.get(Order, order_id).status == (
+                        "PREPARANDO" if approval_commits_first else "PENDIENTE_ACEPTACION"
+                    )
+                    assert verification.get(Payment, payment_id).status == (
+                        "APROBADO" if approval_commits_first else "PENDIENTE_VERIFICACION"
+                    )
+            finally:
+                release_approval.set()
+            assert approval.result(timeout=10).status_code == 200
+    finally:
+        event.remove(postgres_engine, "after_cursor_execute", hold_approval)
+    if not approval_commits_first:
+        assert prepare().status_code == 200
+    with Session(postgres_engine) as verification:
+        assert verification.get(Order, order_id).status == "PREPARANDO"
+        assert verification.get(Payment, payment_id).status == "APROBADO"
+
+
+@pytest.mark.parametrize("legacy_status", ["PENDIENTE_ACEPTACION", "CANCELADO", "PREPARANDO"])
+def test_payment_migration_backfill_and_legacy_guard(postgres_engine, legacy_status):
+    import importlib.util
+    from pathlib import Path
+    from uuid import uuid4
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+
+    spec = importlib.util.spec_from_file_location(
+        "payment_migration", Path(__file__).parents[1] / "alembic/versions/0005_payments.py",
+    )
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    # Isolate migration checks; roll back the entire temporary schema afterwards.
+    with postgres_engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            schema = "payment_migration_" + uuid4().hex
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            connection.execute(text("SELECT set_config('search_path', :schema, true)"), {"schema": schema})
+            Order.__table__.create(connection)
+            connection.execute(Order.__table__.insert().values(total=0, status=legacy_status))
+            with Operations.context(MigrationContext.configure(connection)):
+                if legacy_status == "PREPARANDO":
+                    with pytest.raises(DBAPIError, match="Resolve legacy advanced orders"):
+                        with connection.begin_nested():
+                            migration.upgrade()
+                    assert connection.scalar(text("SELECT to_regclass('payments')")) is None
+                else:
+                    migration.upgrade()
+                    row = connection.execute(text("SELECT order_id, status FROM payments")).one()
+                    assert row == (1, "PENDIENTE_COMPROBANTE")
+        finally:
+            transaction.rollback()

@@ -50,3 +50,18 @@ This project intentionally progresses from basic CRUD toward:
 - production reliability
 
 Do not prematurely implement later-stage concepts unless explicitly requested.
+### Complex Test Documentation
+
+For any non-trivial test involving concurrency, transactions, migrations, idempotency, locking, race conditions, or PostgreSQL-specific behavior, add a short docstring in Spanish at the beginning of the test.
+
+The docstring must explain:
+
+- **Contexto:** the real-world situation being simulated.
+- **Garantía:** the invariant or system property the test is proving.
+- **Escenarios:** the important execution orderings or outcomes being tested.
+
+Keep the explanation concise. Do not document the test implementation line by line, and do not explain pytest, SQLAlchemy, threading, event-listener, or database instrumentation plumbing unless that mechanism is itself the behavior under test.
+
+The purpose of the docstring is to let a reviewer understand **why the test exists and what failure it is supposed to detect before reading its implementation**.
+
+For complex tests, optimize for reviewability of the system guarantee rather than explanation of implementation details.

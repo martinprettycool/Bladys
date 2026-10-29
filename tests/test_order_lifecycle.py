@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from bladys.models import Order, OrderItem, Product, ProductVariant
+from bladys.models import Payment, Order, OrderItem, Product, ProductVariant
 
 
 STATES = (
@@ -27,7 +27,7 @@ def test_order_lifecycle_transitions(client, session, engine, source, target):
     session.add(Product(name="Pizza", variants=[variant]))
     session.flush()
     order = Order(
-        status=source, total=Decimal("6.00"),
+        status=source, total=Decimal("6.00"), payment=Payment(status="APROBADO"),
         items=[OrderItem(variant_id=variant.id, quantity=2, unit_price=Decimal("3.00"))],
     )
     session.add(order)
@@ -76,7 +76,7 @@ def test_invalid_status_payload_is_rejected(client, session, payload):
 
 
 def test_kitchen_lifecycle_and_late_customer_cancellation(client, session):
-    order = Order(total=Decimal("0.00"))
+    order = Order(total=Decimal("0.00"), payment=Payment(status="APROBADO"))
     session.add(order)
     session.commit()
     url = f"/orders/{order.id}/status"

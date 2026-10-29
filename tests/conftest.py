@@ -87,6 +87,7 @@ def postgres_client(
 @pytest.fixture
 def clean_postgres_db(postgres_engine):
     tables = """
+        payments,
         idempotency_records,
         order_items,
         orders,
