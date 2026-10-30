@@ -3,7 +3,7 @@ from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from bladys.models import Order, Payment
+from bladys.models import Order, Payment, UserRole
 from test_orders import seeded_order_client
 
 
@@ -27,8 +27,8 @@ def submit(client, order_id):
     return client.post(f"/orders/{order_id}/payment/proof", json={"proof_reference": "opaque:receipt-123"})
 
 
-def decide(client, payment_id, status):
-    return client.patch(f"/payments/{payment_id}/status", json={"status": status})
+def decide(client, payment_id, status, staff_headers):
+    return client.patch(f"/payments/{payment_id}/status", json={"status": status}, headers=staff_headers[UserRole.RECEPTION])
 
 
 def test_creation_retry_has_one_payment(client, payment_order, engine):
@@ -42,18 +42,18 @@ def test_creation_retry_has_one_payment(client, payment_order, engine):
 
 
 @pytest.mark.parametrize("decision", ["APROBADO", "RECHAZADO"])
-def test_proof_and_reception(client, payment_order, engine, decision):
+def test_proof_and_reception(client, payment_order, engine, decision, staff_headers):
     order_id, payment_id = payment_order
-    assert client.get("/payments/pending").json() == []
+    assert client.get("/payments/pending", headers=staff_headers[UserRole.RECEPTION]).json() == []
     proof = submit(client, order_id)
     assert proof.status_code == 200
     assert proof.json()["status"] == "PENDIENTE_VERIFICACION"
     assert proof.json()["proof_reference"] == "opaque:receipt-123"
-    assert [p["id"] for p in client.get("/payments/pending").json()] == [payment_id]
-    assert decide(client, payment_id, decision).status_code == 200
-    assert client.get("/payments/pending").json() == []
+    assert [p["id"] for p in client.get("/payments/pending", headers=staff_headers[UserRole.RECEPTION]).json()] == [payment_id]
+    assert decide(client, payment_id, decision, staff_headers).status_code == 200
+    assert client.get("/payments/pending", headers=staff_headers[UserRole.RECEPTION]).json() == []
     assert submit(client, order_id).status_code == 409
-    assert decide(client, payment_id, "APROBADO").status_code == 409
+    assert decide(client, payment_id, "APROBADO", staff_headers).status_code == 409
     with Session(engine) as db:
         assert db.get(Payment, payment_id).status == decision
         assert db.get(Order, order_id).status == (
@@ -75,35 +75,39 @@ def test_proof_cannot_be_resubmitted(client, payment_order, engine, status):
 
 
 @pytest.mark.parametrize("status", ["PENDIENTE_COMPROBANTE", "PENDIENTE_VERIFICACION", "RECHAZADO", "APROBADO"])
-def test_kitchen_gate_and_visibility(client, payment_order, engine, status):
+def test_kitchen_gate_and_visibility(client, payment_order, engine, status, staff_headers):
     order_id, payment_id = payment_order
     with Session(engine) as db:
         db.get(Payment, payment_id).status = status
         db.commit()
-    assert [o["id"] for o in client.get("/kitchen/orders/pending").json()] == (
+    assert [o["id"] for o in client.get("/kitchen/orders/pending", headers=staff_headers[UserRole.KITCHEN]).json()] == (
         [order_id] if status == "APROBADO" else []
     )
-    response = client.patch(f"/orders/{order_id}/status", json={"status": "PREPARANDO"})
+    response = client.patch(f"/kitchen/orders/{order_id}/status", json={"status": "PREPARANDO"}, headers=staff_headers[UserRole.KITCHEN])
     assert response.status_code == (200 if status == "APROBADO" else 409)
     with Session(engine) as db:
         assert db.get(Order, order_id).status == (
             "PREPARANDO" if status == "APROBADO" else "PENDIENTE_ACEPTACION"
         )
-    assert client.get("/kitchen/orders/pending").json() == []
+    assert client.get("/kitchen/orders/pending", headers=staff_headers[UserRole.KITCHEN]).json() == []
 
 
-def test_paid_customer_cancellation(client, payment_order, engine):
+def test_paid_customer_cancellation(client, payment_order, engine, staff_headers):
     order_id, payment_id = payment_order
     assert submit(client, order_id).status_code == 200
-    assert decide(client, payment_id, "APROBADO").status_code == 200
+    assert decide(client, payment_id, "APROBADO", staff_headers).status_code == 200
     assert client.patch(f"/orders/{order_id}/status", json={"status": "CANCELADO"}).status_code == 200
     with Session(engine) as db:
         assert db.get(Order, order_id).status == "CANCELADO"
         assert db.get(Payment, payment_id).status == "APROBADO"
-    assert client.get("/kitchen/orders/pending").json() == []
+    assert client.get("/kitchen/orders/pending", headers=staff_headers[UserRole.KITCHEN]).json() == []
 
 
-def test_rejection_rolls_back_if_cancellation_fails(client, payment_order, engine):
+def test_rejection_rolls_back_if_cancellation_fails(client, payment_order, engine, staff_headers):
+    """Contexto: falla la cancelación al rechazar un pago.
+    Garantía: pago y pedido conservan su estado previo si falla la operación.
+    Escenarios: el pago se actualiza pero la cancelación falla antes del commit.
+    """
     order_id, payment_id = payment_order
     assert submit(client, order_id).status_code == 200
 
@@ -114,7 +118,7 @@ def test_rejection_rolls_back_if_cancellation_fails(client, payment_order, engin
     event.listen(engine, "before_cursor_execute", fail_cancel)
     try:
         with pytest.raises(RuntimeError, match="cancellation failure"):
-            decide(client, payment_id, "RECHAZADO")
+            decide(client, payment_id, "RECHAZADO", staff_headers)
     finally:
         event.remove(engine, "before_cursor_execute", fail_cancel)
     with Session(engine) as db:
@@ -138,14 +142,14 @@ def test_payment_insert_failure_rolls_back_order(client, seeded_order_client, en
 
 
 @pytest.mark.parametrize("decision", ["APROBADO", "RECHAZADO"])
-def test_decision_requires_verification(client, payment_order, decision):
-    assert decide(client, payment_order[1], decision).status_code == 409
+def test_decision_requires_verification(client, payment_order, decision, staff_headers):
+    assert decide(client, payment_order[1], decision, staff_headers).status_code == 409
 
 
-def test_missing_payment_and_invalid_payload(client):
+def test_missing_payment_and_invalid_payload(client, staff_headers):
     assert submit(client, 999).status_code == 404
-    assert decide(client, 999, "APROBADO").status_code == 404
-    assert decide(client, 999, "PENDIENTE_COMPROBANTE").status_code == 422
+    assert decide(client, 999, "APROBADO", staff_headers).status_code == 404
+    assert decide(client, 999, "PENDIENTE_COMPROBANTE", staff_headers).status_code == 422
     assert client.post("/orders/999/payment/proof", json={"proof_reference": ""}).status_code == 422
 
 

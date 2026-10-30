@@ -5,18 +5,33 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
+from bladys.authentication import authenticate_user
+from bladys.tokens import create_access_token
 from bladys.database import get_session
-from bladys.models import Payment, Order, OrderItem, Product, ProductVariant, IdempotencyRecord
+from bladys.dependencies import require_role
+from bladys.models import Payment, Order, OrderItem, Product, ProductVariant, IdempotencyRecord, UserRole
 from bladys.schemas import (
+    LoginRequest, TokenResponse, KitchenOrderStatusUpdate,
     PaymentProofSubmission, PaymentDecision, PaymentResponse,
     OrderCreate, OrderResponse, OrderStatusUpdate, ProductResponse,
 )
-from bladys.order_lifecycle import EXPECTED_STATUS
+from bladys.order_lifecycle import EXPECTED_STATUS, OrderStatus
 import hashlib
 import json
 from bladys.idempotency import build_request_hash
 
 app = FastAPI()
+
+
+@app.post("/login", response_model=TokenResponse)
+def login(payload: LoginRequest, session: Session = Depends(get_session)):
+    user = authenticate_user(session, payload.username, payload.password)
+    if user is None:
+        raise HTTPException(401, detail="Invalid username or password")
+    return TokenResponse(
+        access_token=create_access_token(user.id),
+        token_type="bearer",
+    )
 
 
 @app.get("/products", response_model=list[ProductResponse])
@@ -157,54 +172,75 @@ def replace_order_items(
     return response
 
 
-@app.patch("/orders/{order_id}/status", response_model=OrderResponse)
-def update_order_status(
-    order_id: int,
-    payload: OrderStatusUpdate,
-    session: Session = Depends(get_session),
-):
-    """Advance kitchen status, or request customer cancellation with CANCELADO.
-
-    Cancellation is allowed only before kitchen acceptance. No authentication
-    or actor permissions are enforced by this MVP endpoint.
-    """
-    expected_status = EXPECTED_STATUS.get(payload.status)
-    with session.begin():
-        updated = 0
-        if expected_status is not None:
-            # Check and write in one statement: competing transitions cannot
-            # both consume the same predecessor, even if both saw it earlier.
-            conditions = [Order.id == order_id, Order.status == expected_status]
-            if payload.status == "PREPARANDO":
-                conditions.append(select(Payment.id).where(
-                    Payment.order_id == Order.id, Payment.status == "APROBADO",
-                ).exists())
-            result = session.execute(
-                update(Order)
-                .where(*conditions)
-                .values(status=payload.status)
-                .execution_options(synchronize_session=False)
-            )
-            updated = result.rowcount
-
-        # Read fresh database state after the attempt, including on a lost race.
-        order = session.scalar(
-            select(Order)
-            .where(Order.id == order_id)
-            .options(selectinload(Order.items))
-            .execution_options(populate_existing=True)
+def transition_order_status(session: Session, order_id: int, target: OrderStatus):
+    """Apply lifecycle rules inside the caller's transaction."""
+    expected_status = EXPECTED_STATUS.get(target)
+    updated = 0
+    if expected_status is not None:
+        # Check and write in one statement: competing transitions cannot
+        # both consume the same predecessor, even if both saw it earlier.
+        conditions = [Order.id == order_id, Order.status == expected_status]
+        if target == "PREPARANDO":
+            conditions.append(select(Payment.id).where(
+                Payment.order_id == Order.id, Payment.status == "APROBADO",
+            ).exists())
+        result = session.execute(
+            update(Order)
+            .where(*conditions)
+            .values(status=target)
+            .execution_options(synchronize_session=False)
         )
-        if order is None:
-            raise HTTPException(404, detail="El pedido no existe")
-        if updated == 0:
-            raise HTTPException(
-                409,
-                detail=f"Transicion no permitida: {order.status} -> {payload.status}",
-            )
-        response = OrderResponse.model_validate(order)
+        updated = result.rowcount
+
+    # Read fresh database state after the attempt, including on a lost race.
+    order = session.scalar(
+        select(Order)
+        .where(Order.id == order_id)
+        .options(selectinload(Order.items))
+        .execution_options(populate_existing=True)
+    )
+    if order is None:
+        raise HTTPException(404, detail="El pedido no existe")
+    if updated == 0:
+        raise HTTPException(
+            409,
+            detail=f"Transicion no permitida: {order.status} -> {target}",
+        )
+    response = OrderResponse.model_validate(order)
     return response
 
-@app.get("/kitchen/orders/pending", response_model=list[OrderResponse])
+
+@app.patch("/orders/{order_id}/status", response_model=OrderResponse)
+def update_order_status(
+    order_id: int, payload: OrderStatusUpdate,
+    session: Session = Depends(get_session),
+):
+    """Cancel a pending order; customer authentication remains out of scope."""
+    with session.begin():
+        return transition_order_status(session, order_id, payload.status)
+
+
+@app.patch(
+    "/kitchen/orders/{order_id}/status", response_model=OrderResponse,
+    dependencies=[Depends(require_role(UserRole.KITCHEN))],
+)
+def update_kitchen_order_status(
+    order_id: int, payload: KitchenOrderStatusUpdate,
+    session: Session = Depends(get_session),
+):
+    try:
+        response = transition_order_status(session, order_id, payload.status)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return response
+
+
+@app.get(
+    "/kitchen/orders/pending", response_model=list[OrderResponse],
+    dependencies=[Depends(require_role(UserRole.KITCHEN))],
+)
 def kitchen_pending_orders(session: Session = Depends(get_session)):
     return session.scalars(
         select(Order).join(Payment).where(
@@ -235,19 +271,25 @@ def submit_payment_proof(
     return response
 
 
-@app.get("/payments/pending", response_model=list[PaymentResponse])
+@app.get(
+    "/payments/pending", response_model=list[PaymentResponse],
+    dependencies=[Depends(require_role(UserRole.RECEPTION))],
+)
 def payments_pending_verification(session: Session = Depends(get_session)):
     return session.scalars(select(Payment).where(
         Payment.status == "PENDIENTE_VERIFICACION",
     ).order_by(Payment.id)).all()
 
 
-@app.patch("/payments/{payment_id}/status", response_model=PaymentResponse)
+@app.patch(
+    "/payments/{payment_id}/status", response_model=PaymentResponse,
+    dependencies=[Depends(require_role(UserRole.RECEPTION))],
+)
 def decide_payment(
     payment_id: int, payload: PaymentDecision,
     session: Session = Depends(get_session),
 ):
-    with session.begin():
+    try:
         result = session.execute(
             update(Payment).where(
                 Payment.id == payment_id, Payment.status == "PENDIENTE_VERIFICACION",
@@ -263,4 +305,8 @@ def decide_payment(
             session.execute(update(Order).where(Order.id == payment.order_id)
                             .values(status="CANCELADO").execution_options(synchronize_session=False))
         response = PaymentResponse.model_validate(payment)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     return response

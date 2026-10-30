@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from sqlalchemy import (
     Boolean, CheckConstraint, DateTime, ForeignKey, Numeric, String, Text, func, true,
@@ -133,3 +134,25 @@ class Payment(Base):
     )
     proof_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
     order: Mapped[Order] = relationship(back_populates="payment")
+
+
+class UserRole(StrEnum):
+    KITCHEN = "KITCHEN"
+    RECEPTION = "RECEPTION"
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('KITCHEN', 'RECEPTION')", name="ck_users_role",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(nullable=False)
+    role: Mapped[UserRole] = mapped_column(String, nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False,
+    )

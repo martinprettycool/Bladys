@@ -87,6 +87,7 @@ def postgres_client(
 @pytest.fixture
 def clean_postgres_db(postgres_engine):
     tables = """
+        users,
         payments,
         idempotency_records,
         order_items,
@@ -155,3 +156,33 @@ def client(engine):
             yield test_client
     finally:
         app.dependency_overrides.pop(get_session, None)
+
+
+@pytest.fixture
+def staff_headers(session, monkeypatch):
+    from bladys.models import User, UserRole
+    from bladys.tokens import create_access_token
+
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-only-jwt-secret-not-for-production-123456789")
+    users = [User(username=f"staff-{role}", password_hash="unused", role=role)
+             for role in UserRole]
+    session.add_all(users)
+    session.commit()
+    return {user.role: {"Authorization": f"Bearer {create_access_token(user.id)}"}
+            for user in users}
+
+
+@pytest.fixture
+def postgres_staff_headers(postgres_session, monkeypatch):
+    from bladys.models import User, UserRole
+    from bladys.tokens import create_access_token
+
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-only-jwt-secret-not-for-production-123456789")
+    users = [User(username=f"staff-{role}", password_hash="unused", role=role)
+             for role in UserRole]
+    postgres_session.add_all(users)
+    postgres_session.commit()
+    headers = {user.role: {"Authorization": f"Bearer {create_access_token(user.id)}"}
+               for user in users}
+    postgres_session.rollback()
+    return headers

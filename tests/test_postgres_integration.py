@@ -1,5 +1,5 @@
 import pytest
-from bladys.models import Payment, Product, ProductVariant, Order
+from bladys.models import Payment, Product, ProductVariant, Order, UserRole
 from decimal import Decimal 
 
 @pytest.fixture
@@ -145,8 +145,12 @@ def test_concurrent_same_key_and_intent_returns_same_order(
 
 
 def test_concurrent_cancellation_and_preparation_only_one_wins(
-    postgres_client, postgres_engine, postgres_session,
+    postgres_client, postgres_engine, postgres_session, postgres_staff_headers,
 ):
+    """Contexto: cliente cancela mientras cocina acepta un pedido pagado.
+    Garantía: solo una transición consume el estado pendiente.
+    Escenarios: ambas operaciones observan pendiente y solo una confirma.
+    """
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier, Lock
 
@@ -182,7 +186,8 @@ def test_concurrent_cancellation_and_preparation_only_one_wins(
 
     def transition(target):
         return postgres_client.patch(
-            f"/orders/{order_id}/status", json={"status": target},
+            f"{'/orders' if target == 'CANCELADO' else '/kitchen/orders'}/{order_id}/status",
+            json={"status": target}, headers=postgres_staff_headers[UserRole.KITCHEN],
         )
 
     event.listen(postgres_engine, "before_cursor_execute", before_update)
@@ -225,8 +230,12 @@ def test_postgres_rejects_unsupported_order_status(postgres_session):
 
 @pytest.mark.parametrize("winner", ["modification", "kitchen"])
 def test_replacement_vs_preparation_row_lock(
-    postgres_client, postgres_engine, postgres_session, postgres_order_variant_id, winner,
+    postgres_client, postgres_engine, postgres_session, postgres_order_variant_id, winner, postgres_staff_headers,
 ):
+    """Contexto: cliente modifica mientras cocina acepta el pedido.
+    Garantía: la modificación solo confirma antes de la aceptación.
+    Escenarios: gana primero la modificación o la cocina y la otra espera el bloqueo.
+    """
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
     from time import monotonic, sleep
@@ -279,7 +288,8 @@ def test_replacement_vs_preparation_row_lock(
         ]})
 
     def prepare():
-        return postgres_client.patch(f"/orders/{order_id}/status", json={"status": "PREPARANDO"})
+        return postgres_client.patch(f"/kitchen/orders/{order_id}/status", json={"status": "PREPARANDO"},
+                                     headers=postgres_staff_headers[UserRole.KITCHEN])
 
     event.listen(postgres_engine, "before_cursor_execute", before_execute)
     event.listen(postgres_engine, "after_cursor_execute", after_execute)
@@ -324,8 +334,12 @@ def test_replacement_vs_preparation_row_lock(
 
 @pytest.mark.parametrize("approval_commits_first", [False, True])
 def test_approval_vs_preparation_committed_visibility(
-    postgres_client, postgres_engine, postgres_session, approval_commits_first,
+    postgres_client, postgres_engine, postgres_session, approval_commits_first, postgres_staff_headers,
 ):
+    """Contexto: recepción aprueba mientras cocina intenta preparar.
+    Garantía: solo una aprobación confirmada habilita la preparación.
+    Escenarios: la aprobación confirma antes o después del intento de cocina.
+    """
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
     from sqlalchemy import event
@@ -353,14 +367,16 @@ def test_approval_vs_preparation_committed_visibility(
                 assert release_approval.wait(15)
 
     def prepare():
-        return postgres_client.patch(f"/orders/{order_id}/status", json={"status": "PREPARANDO"})
+        return postgres_client.patch(f"/kitchen/orders/{order_id}/status", json={"status": "PREPARANDO"},
+                                     headers=postgres_staff_headers[UserRole.KITCHEN])
 
     event.listen(postgres_engine, "after_cursor_execute", hold_approval)
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
             try:
                 approval = executor.submit(postgres_client.patch,
-                    f"/payments/{payment_id}/status", json={"status": "APROBADO"})
+                    f"/payments/{payment_id}/status", json={"status": "APROBADO"},
+                    headers=postgres_staff_headers[UserRole.RECEPTION])
                 assert approval_updated.wait(10)
                 if approval_commits_first:
                     release_approval.set()

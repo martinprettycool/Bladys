@@ -48,7 +48,13 @@ class OrderItemResponse(BaseModel):
 class OrderStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: OrderStatus
+    status: Literal[OrderStatus.CANCELADO]
+
+
+class KitchenOrderStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal[OrderStatus.PREPARANDO, OrderStatus.LISTO, OrderStatus.ENVIADO]
 
 
 class OrderResponse(BaseModel):
@@ -79,3 +85,15 @@ class PaymentResponse(BaseModel):
     order_id: int
     status: PaymentStatus
     proof_reference: str | None
+
+
+class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"]
