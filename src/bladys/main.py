@@ -7,13 +7,14 @@ from sqlalchemy.exc import IntegrityError
 
 from bladys.authentication import authenticate_user
 from bladys.tokens import create_access_token
+from bladys.order_tokens import create_order_access_token
 from bladys.database import get_session
-from bladys.dependencies import require_role
+from bladys.dependencies import get_owned_order, require_role
 from bladys.models import Payment, Order, OrderItem, Product, ProductVariant, IdempotencyRecord, UserRole
 from bladys.schemas import (
     LoginRequest, TokenResponse, KitchenOrderStatusUpdate,
     PaymentProofSubmission, PaymentDecision, PaymentResponse,
-    OrderCreate, OrderResponse, OrderStatusUpdate, ProductResponse,
+    OrderCreate, OrderCreateResponse, OrderResponse, OrderStatusUpdate, ProductResponse,
 )
 from bladys.order_lifecycle import EXPECTED_STATUS, OrderStatus
 import hashlib
@@ -87,7 +88,14 @@ def build_order_items(session: Session, quantities: dict[int, int]):
     return order_items, total
 
 
-@app.post("/orders", response_model=OrderResponse, status_code=201)
+def build_order_create_response(order: Order) -> OrderCreateResponse:
+    return OrderCreateResponse(
+        **OrderResponse.model_validate(order).model_dump(),
+        order_access_token=create_order_access_token(order.id),
+    )
+
+
+@app.post("/orders", response_model=OrderCreateResponse, status_code=201)
 def create_order(payload: OrderCreate, session: Session = Depends(get_session), idempotency_key: str =Header(...,alias="Idempotency-Key")):
     quantities = normalize_items(payload)
     hash_intention = build_request_hash(quantities=quantities)
@@ -99,12 +107,7 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
                 if existing_record.request_hash == hash_intention:
                     #retry
                     retry_order = session.get(Order, existing_record.order_id)
-                    response = OrderResponse(
-                        id = retry_order.id,
-                        status= retry_order.status,
-                        total= retry_order.total,
-                        items = retry_order.items
-                    )
+                    response = build_order_create_response(retry_order)
                     return response
                 else:
                     raise HTTPException(409, detail='conflict')
@@ -127,7 +130,7 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
                 order_id = order.id
             )
             session.add(idempotency_record)
-            response = OrderResponse.model_validate(order)
+            response = build_order_create_response(order)
 
     except IntegrityError:
         # The transaction context has rolled back before recovery starts.
@@ -139,18 +142,22 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
         if existing_record.request_hash != hash_intention:
             raise HTTPException(409, detail="conflict")
         order = session.get(Order, existing_record.order_id)
-        response = OrderResponse.model_validate(order)
+        response = build_order_create_response(order)
 
     return response
 
 
-@app.put("/orders/{order_id}/items", response_model=OrderResponse)
+@app.put(
+    "/orders/{order_id}/items", response_model=OrderResponse,
+    dependencies=[Depends(get_owned_order)],
+)
 def replace_order_items(
     order_id: int,
     payload: OrderCreate,
     session: Session = Depends(get_session),
 ):
-    with session.begin():
+    # Authorization has already started the shared session transaction.
+    try:
         # Lock before inspecting status; the kitchen UPDATE takes the same row lock.
         order = session.scalar(
             select(Order).where(Order.id == order_id).with_for_update()
@@ -169,6 +176,10 @@ def replace_order_items(
         order.total = total
         session.flush()
         response = OrderResponse.model_validate(order)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     return response
 
 
@@ -210,14 +221,23 @@ def transition_order_status(session: Session, order_id: int, target: OrderStatus
     return response
 
 
-@app.patch("/orders/{order_id}/status", response_model=OrderResponse)
+@app.patch(
+    "/orders/{order_id}/status", response_model=OrderResponse,
+    dependencies=[Depends(get_owned_order)],
+)
 def update_order_status(
     order_id: int, payload: OrderStatusUpdate,
     session: Session = Depends(get_session),
 ):
-    """Cancel a pending order; customer authentication remains out of scope."""
-    with session.begin():
-        return transition_order_status(session, order_id, payload.status)
+    """Authorize ownership, then atomically cancel only a pending order."""
+    # Ownership lookup has already started the shared session transaction.
+    try:
+        response = transition_order_status(session, order_id, payload.status)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return response
 
 
 @app.patch(
@@ -249,12 +269,16 @@ def kitchen_pending_orders(session: Session = Depends(get_session)):
     ).all()
 
 
-@app.post("/orders/{order_id}/payment/proof", response_model=PaymentResponse)
+@app.post(
+    "/orders/{order_id}/payment/proof", response_model=PaymentResponse,
+    dependencies=[Depends(get_owned_order)],
+)
 def submit_payment_proof(
     order_id: int, payload: PaymentProofSubmission,
     session: Session = Depends(get_session),
 ):
-    with session.begin():
+    # Ownership lookup has already started the shared session transaction.
+    try:
         result = session.execute(
             update(Payment).where(
                 Payment.order_id == order_id, Payment.status == "PENDIENTE_COMPROBANTE",
@@ -268,6 +292,10 @@ def submit_payment_proof(
         if result.rowcount != 1:
             raise HTTPException(409, detail="El pago no permite enviar comprobante")
         response = PaymentResponse.model_validate(payment)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     return response
 
 

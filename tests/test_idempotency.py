@@ -1,6 +1,9 @@
 from decimal import Decimal
 
+import jwt
 import pytest
+
+from bladys.config import JWT_ALGORITHM, get_order_access_settings
 from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -146,6 +149,10 @@ def test_request_hash_is_independent_of_dict_order(quantities):
 def test_integrity_error_recovers_persisted_winner(
     idempotency_client, engine, monkeypatch, quantity, expected_status,
 ):
+    """Contexto: una creación pierde frente a otra con la misma clave.
+    Garantía: se conserva un pedido y se emite una capacidad para el ganador.
+    Escenarios: el mismo intento recupera el ganador; otro intento recibe conflicto.
+    """
     headers = {"Idempotency-Key": "race-winner"}
     winner = idempotency_client.post(
         "/orders", headers=headers,
@@ -183,7 +190,14 @@ def test_integrity_error_recovers_persisted_winner(
     assert "UNIQUE constraint failed: idempotency_records.key" in str(failed_inserts[0].orig)
     assert response.status_code == expected_status
     if expected_status == 201:
-        assert response.json() == winner.json()
+        result = response.json()
+        winner_body = winner.json()
+        for body in (result, winner_body):
+            claims = jwt.decode(body.pop("order_access_token"),
+                                get_order_access_settings().secret_key, algorithms=[JWT_ALGORITHM])
+            assert claims["sub"] == str(winner_body["id"])
+            assert claims["purpose"] == "order_access"
+        assert result == winner_body
     with Session(engine) as session:
         assert session.scalars(select(Order.id)).all() == [winner.json()["id"]]
         assert session.scalar(select(func.count()).select_from(OrderItem)) == 1

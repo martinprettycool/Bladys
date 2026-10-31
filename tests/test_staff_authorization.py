@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from bladys.config import JWT_ALGORITHM, get_jwt_settings
+from bladys.order_tokens import create_order_access_token
 from bladys.models import Order, Payment, User, UserRole
 
 
@@ -86,7 +87,8 @@ def test_staff_operations_authorization(
 
 @pytest.mark.parametrize("target", ["PREPARANDO", "LISTO", "ENVIADO", "RECHAZADO"])
 def test_customer_route_cannot_change_staff_states(client, session, staff_order, target):
-    response = client.patch(f"/orders/{staff_order.id}/status", json={"status": target})
+    response = client.patch(f"/orders/{staff_order.id}/status", json={"status": target},
+                            headers={"X-Order-Access-Token": create_order_access_token(staff_order.id)})
     assert response.status_code == 422
     session.refresh(staff_order)
     assert staff_order.status == "PENDIENTE_ACEPTACION"

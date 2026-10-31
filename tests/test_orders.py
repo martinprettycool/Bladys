@@ -40,7 +40,9 @@ def test_create_order_consolidates_and_snapshots_prices(seeded_order_client, eng
     ]})
     assert response.status_code == 201
     body = response.json()
+    assert isinstance(body["order_access_token"], str)
     assert body == {
+        "order_access_token": body["order_access_token"],
         "id": body["id"], "status": "PENDIENTE_ACEPTACION", "total": "22.25",
         "items": [
             {"variant_id": 10, "quantity": 5, "unit_price": "3.00"},

@@ -61,3 +61,18 @@ Apply migration `0005` with Alembic before running the new application. It backf
 pending Payments for existing Orders and refuses advanced legacy Orders
 (PREPARANDO/LISTO/ENVIADO); resolve their payment-history policy explicitly before
 migration rather than inventing approvals. No migration is run on startup.
+
+
+## Guest Order access-token issuance
+
+Set `ORDER_ACCESS_SECRET_KEY` in the environment (or local `.env`) to a strong
+secret distinct from the staff `JWT_SECRET_KEY`. There is no fallback to the staff
+secret. `ORDER_ACCESS_TOKEN_EXPIRE_MINUTES` defaults to 1440 (24 hours) and must be
+a positive integer.
+
+`POST /orders` returns the existing Order fields plus `order_access_token`.
+The signed capability contains `sub` (Order ID as a string), `purpose` set to
+`order_access`, `iat`, and `exp`. It represents possession of authority over one
+Order, not a staff identity. Tokens are not persisted. Same-key, same-intent retries
+return the same Order with a newly issued token; token strings may differ.
+This step only issues tokens; existing Order endpoints do not enforce ownership yet.

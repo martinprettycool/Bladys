@@ -186,3 +186,9 @@ def postgres_staff_headers(postgres_session, monkeypatch):
                for user in users}
     postgres_session.rollback()
     return headers
+
+
+@pytest.fixture(autouse=True)
+def order_access_environment(monkeypatch):
+    monkeypatch.setenv("ORDER_ACCESS_SECRET_KEY", "test-only-order-capability-secret-123456789")
+    monkeypatch.delenv("ORDER_ACCESS_TOKEN_EXPIRE_MINUTES", raising=False)

@@ -1,4 +1,7 @@
+import jwt
 import pytest
+from bladys.config import JWT_ALGORITHM, get_order_access_settings
+from bladys.order_tokens import create_order_access_token
 from bladys.models import Payment, Product, ProductVariant, Order, UserRole
 from decimal import Decimal 
 
@@ -57,6 +60,10 @@ def test_concurrent_same_key_and_intent_returns_same_order(
     postgres_order_variant_id,
     monkeypatch,
 ):
+    """Contexto: dos clientes reintentan simultÃ¡neamente el mismo pedido.
+    GarantÃ­a: existe un solo pedido y ambas respuestas autorizan ese pedido.
+    Escenarios: ambas consultas iniciales fallan; una inserciÃ³n gana y la otra recupera.
+    """
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier, Lock
 
@@ -128,6 +135,11 @@ def test_concurrent_same_key_and_intent_returns_same_order(
     assert [response.status_code for response in responses] == [201, 201]
     order_id = responses[0].json()["id"]
     assert responses[1].json()["id"] == order_id
+    for response in responses:
+        claims = jwt.decode(response.json()["order_access_token"],
+                            get_order_access_settings().secret_key, algorithms=[JWT_ALGORITHM])
+        assert claims["sub"] == str(order_id)
+        assert claims["purpose"] == "order_access"
 
     # Read committed state after both request transactions have finished.
     with Session(postgres_engine) as verification_session:
@@ -148,7 +160,7 @@ def test_concurrent_cancellation_and_preparation_only_one_wins(
     postgres_client, postgres_engine, postgres_session, postgres_staff_headers,
 ):
     """Contexto: cliente cancela mientras cocina acepta un pedido pagado.
-    Garantía: solo una transición consume el estado pendiente.
+    GarantÃ­a: solo una transiciÃ³n consume el estado pendiente.
     Escenarios: ambas operaciones observan pendiente y solo una confirma.
     """
     from concurrent.futures import ThreadPoolExecutor
@@ -187,7 +199,9 @@ def test_concurrent_cancellation_and_preparation_only_one_wins(
     def transition(target):
         return postgres_client.patch(
             f"{'/orders' if target == 'CANCELADO' else '/kitchen/orders'}/{order_id}/status",
-            json={"status": target}, headers=postgres_staff_headers[UserRole.KITCHEN],
+            json={"status": target},
+            headers=({"X-Order-Access-Token": create_order_access_token(order_id)}
+                     if target == "CANCELADO" else postgres_staff_headers[UserRole.KITCHEN]),
         )
 
     event.listen(postgres_engine, "before_cursor_execute", before_update)
@@ -233,8 +247,8 @@ def test_replacement_vs_preparation_row_lock(
     postgres_client, postgres_engine, postgres_session, postgres_order_variant_id, winner, postgres_staff_headers,
 ):
     """Contexto: cliente modifica mientras cocina acepta el pedido.
-    Garantía: la modificación solo confirma antes de la aceptación.
-    Escenarios: gana primero la modificación o la cocina y la otra espera el bloqueo.
+    GarantÃ­a: la modificaciÃ³n solo confirma antes de la aceptaciÃ³n.
+    Escenarios: gana primero la modificaciÃ³n o la cocina y la otra espera el bloqueo.
     """
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -283,7 +297,9 @@ def test_replacement_vs_preparation_row_lock(
             assert release.wait(15), "Timed out releasing winning transaction"
 
     def modify():
-        return postgres_client.put(f"/orders/{order_id}/items", json={"items": [
+        return postgres_client.put(f"/orders/{order_id}/items", headers={
+            "X-Order-Access-Token": created.json()["order_access_token"],
+        }, json={"items": [
             {"variant_id": postgres_order_variant_id, "quantity": 5}
         ]})
 
@@ -336,9 +352,9 @@ def test_replacement_vs_preparation_row_lock(
 def test_approval_vs_preparation_committed_visibility(
     postgres_client, postgres_engine, postgres_session, approval_commits_first, postgres_staff_headers,
 ):
-    """Contexto: recepción aprueba mientras cocina intenta preparar.
-    Garantía: solo una aprobación confirmada habilita la preparación.
-    Escenarios: la aprobación confirma antes o después del intento de cocina.
+    """Contexto: recepciÃ³n aprueba mientras cocina intenta preparar.
+    GarantÃ­a: solo una aprobaciÃ³n confirmada habilita la preparaciÃ³n.
+    Escenarios: la aprobaciÃ³n confirma antes o despuÃ©s del intento de cocina.
     """
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event

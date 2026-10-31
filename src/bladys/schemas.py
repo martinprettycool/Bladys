@@ -66,6 +66,10 @@ class OrderResponse(BaseModel):
     items: list[OrderItemResponse]
 
 
+class OrderCreateResponse(OrderResponse):
+    order_access_token: str
+
+
 class PaymentProofSubmission(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

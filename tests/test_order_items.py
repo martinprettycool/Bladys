@@ -5,6 +5,7 @@ from sqlalchemy import event, select
 from sqlalchemy.orm import Session
 
 from bladys.models import Order, OrderItem, ProductVariant
+from bladys.order_tokens import create_order_access_token
 from test_orders import seeded_order_client
 
 
@@ -15,6 +16,7 @@ def pending_order(seeded_order_client):
         json={"items": [{"variant_id": 10, "quantity": 2}]},
     )
     assert response.status_code == 201
+    seeded_order_client.headers["X-Order-Access-Token"] = response.json()["order_access_token"]
     return response.json()["id"]
 
 
@@ -69,7 +71,9 @@ def test_invalid_variant_preserves_order(client, pending_order, engine, variant,
 
 
 def test_missing_order(client):
-    assert client.put("/orders/999/items", json={"items": [
+    assert client.put("/orders/999/items", headers={
+        "X-Order-Access-Token": create_order_access_token(999),
+    }, json={"items": [
         {"variant_id": 10, "quantity": 1}
     ]}).status_code == 404
 
@@ -101,6 +105,10 @@ def test_replacement_snapshots_current_price(client, pending_order, engine):
 
 
 def test_insert_failure_rolls_back_replacement(client, pending_order, engine):
+    """Contexto: falla la escritura de los nuevos items.
+    Garantía: el pedido conserva sus items y total anteriores.
+    Escenarios: el borrado comienza pero la inserción falla y se revierte todo.
+    """
     def fail_insert(mapper, connection, target):
         raise RuntimeError("replacement insert failure")
 
@@ -113,3 +121,30 @@ def test_insert_failure_rolls_back_replacement(client, pending_order, engine):
     finally:
         event.remove(OrderItem, "before_insert", fail_insert)
     assert_persisted(engine, pending_order, [(10, 2, Decimal("3.00"))])
+
+
+@pytest.mark.parametrize("credential", ["missing", "tampered", "other_order"])
+def test_replacement_requires_matching_order_token(client, pending_order, engine, credential):
+    other = client.post(
+        "/orders", headers={"Idempotency-Key": "other-replacement"},
+        json={"items": [{"variant_id": 10, "quantity": 2}]},
+    )
+    assert other.status_code == 201
+    other_id = other.json()["id"]
+    token = client.headers.pop("X-Order-Access-Token")
+    target_id = pending_order
+    headers = {}
+    if credential == "tampered":
+        header, _, signature = token.split(".")
+        payload = other.json()["order_access_token"].split(".")[1]
+        headers["X-Order-Access-Token"] = f"{header}.{payload}.{signature}"
+        target_id = other_id
+    elif credential == "other_order":
+        headers["X-Order-Access-Token"] = token
+        target_id = other_id
+    response = client.put(f"/orders/{target_id}/items", headers=headers, json={
+        "items": [{"variant_id": 11, "quantity": 5}],
+    })
+    assert response.status_code == (403 if credential == "other_order" else 401)
+    assert_persisted(engine, pending_order, [(10, 2, Decimal("3.00"))])
+    assert_persisted(engine, other_id, [(10, 2, Decimal("3.00"))])

@@ -3,6 +3,7 @@ from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from bladys.order_tokens import create_order_access_token
 from bladys.models import Order, Payment, UserRole
 from test_orders import seeded_order_client
 
@@ -23,8 +24,11 @@ def payment_order(seeded_order_client, engine):
         return order_id, payment.id
 
 
-def submit(client, order_id):
-    return client.post(f"/orders/{order_id}/payment/proof", json={"proof_reference": "opaque:receipt-123"})
+def submit(client, order_id, headers=None):
+    if headers is None:
+        headers = {"X-Order-Access-Token": create_order_access_token(order_id)}
+    return client.post(f"/orders/{order_id}/payment/proof", headers=headers,
+                       json={"proof_reference": "opaque:receipt-123"})
 
 
 def decide(client, payment_id, status, staff_headers):
@@ -72,6 +76,7 @@ def test_proof_cannot_be_resubmitted(client, payment_order, engine, status):
     assert submit(client, order_id).status_code == 409
     with Session(engine) as db:
         assert db.get(Payment, payment_id).proof_reference == "original"
+        assert db.get(Payment, payment_id).status == status
 
 
 @pytest.mark.parametrize("status", ["PENDIENTE_COMPROBANTE", "PENDIENTE_VERIFICACION", "RECHAZADO", "APROBADO"])
@@ -96,7 +101,8 @@ def test_paid_customer_cancellation(client, payment_order, engine, staff_headers
     order_id, payment_id = payment_order
     assert submit(client, order_id).status_code == 200
     assert decide(client, payment_id, "APROBADO", staff_headers).status_code == 200
-    assert client.patch(f"/orders/{order_id}/status", json={"status": "CANCELADO"}).status_code == 200
+    assert client.patch(f"/orders/{order_id}/status", json={"status": "CANCELADO"},
+                        headers={"X-Order-Access-Token": create_order_access_token(order_id)}).status_code == 200
     with Session(engine) as db:
         assert db.get(Order, order_id).status == "CANCELADO"
         assert db.get(Payment, payment_id).status == "APROBADO"
@@ -104,9 +110,9 @@ def test_paid_customer_cancellation(client, payment_order, engine, staff_headers
 
 
 def test_rejection_rolls_back_if_cancellation_fails(client, payment_order, engine, staff_headers):
-    """Contexto: falla la cancelación al rechazar un pago.
-    Garantía: pago y pedido conservan su estado previo si falla la operación.
-    Escenarios: el pago se actualiza pero la cancelación falla antes del commit.
+    """Contexto: falla la cancelaciÃ³n al rechazar un pago.
+    GarantÃ­a: pago y pedido conservan su estado previo si falla la operaciÃ³n.
+    Escenarios: el pago se actualiza pero la cancelaciÃ³n falla antes del commit.
     """
     order_id, payment_id = payment_order
     assert submit(client, order_id).status_code == 200
@@ -146,11 +152,13 @@ def test_decision_requires_verification(client, payment_order, decision, staff_h
     assert decide(client, payment_order[1], decision, staff_headers).status_code == 409
 
 
-def test_missing_payment_and_invalid_payload(client, staff_headers):
+def test_missing_payment_and_invalid_payload(client, staff_headers, payment_order):
     assert submit(client, 999).status_code == 404
     assert decide(client, 999, "APROBADO", staff_headers).status_code == 404
     assert decide(client, 999, "PENDIENTE_COMPROBANTE", staff_headers).status_code == 422
-    assert client.post("/orders/999/payment/proof", json={"proof_reference": ""}).status_code == 422
+    assert client.post(f"/orders/{payment_order[0]}/payment/proof",
+                       headers={"X-Order-Access-Token": create_order_access_token(payment_order[0])},
+                       json={"proof_reference": ""}).status_code == 422
 
 
 def test_payment_unique_order_and_valid_state(payment_order, engine):
@@ -162,3 +170,44 @@ def test_payment_unique_order_and_valid_state(payment_order, engine):
         db.get(Payment, payment_order[1]).status = "UNKNOWN"
         with pytest.raises(IntegrityError, match="ck_payments_status"):
             db.commit()
+
+
+def test_owned_proof_submission_persists_reference_and_transition(client, payment_order, engine):
+    order_id, payment_id = payment_order
+    response = submit(client, order_id)
+    assert response.status_code == 200
+    assert response.json()["proof_reference"] == "opaque:receipt-123"
+    assert response.json()["status"] == "PENDIENTE_VERIFICACION"
+    with Session(engine) as verification:
+        payment = verification.get(Payment, payment_id)
+        assert payment.proof_reference == "opaque:receipt-123"
+        assert payment.status == "PENDIENTE_VERIFICACION"
+
+
+@pytest.mark.parametrize("credential", ["missing", "tampered", "other_order"])
+def test_proof_requires_matching_order_token(client, payment_order, engine, credential):
+    order_a_id, _ = payment_order
+    other = client.post(
+        "/orders", headers={"Idempotency-Key": "other-proof-order"},
+        json={"items": [{"variant_id": 10, "quantity": 1}]},
+    )
+    assert other.status_code == 201
+    order_b_id = other.json()["id"]
+    token_a = create_order_access_token(order_a_id)
+    headers = {}
+    if credential == "tampered":
+        header, _, signature = token_a.split(".")
+        payload_b = other.json()["order_access_token"].split(".")[1]
+        headers["X-Order-Access-Token"] = f"{header}.{payload_b}.{signature}"
+    elif credential == "other_order":
+        headers["X-Order-Access-Token"] = token_a
+    response = submit(client, order_b_id, headers=headers)
+    assert response.status_code == (403 if credential == "other_order" else 401)
+    with Session(engine) as verification:
+        payments = verification.scalars(select(Payment).where(
+            Payment.order_id.in_([order_a_id, order_b_id]),
+        )).all()
+        assert len(payments) == 2
+        for payment in payments:
+            assert payment.status == "PENDIENTE_COMPROBANTE"
+            assert payment.proof_reference is None
