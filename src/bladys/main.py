@@ -1,10 +1,15 @@
 from decimal import Decimal
 
-from fastapi import Depends, FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
+from bladys.payment_proofs import (
+    read_and_validate_payment_proof, save_payment_proof, delete_payment_proof,
+    resolve_payment_proof,
+)
 from bladys.authentication import authenticate_user
 from bladys.tokens import create_access_token
 from bladys.order_tokens import create_order_access_token
@@ -13,7 +18,7 @@ from bladys.dependencies import get_owned_order, require_role
 from bladys.models import Payment, Order, OrderItem, Product, ProductVariant, IdempotencyRecord, UserRole
 from bladys.schemas import (
     LoginRequest, TokenResponse, KitchenOrderStatusUpdate,
-    PaymentProofSubmission, PaymentDecision, PaymentResponse,
+    PaymentDecision, PaymentResponse,
     OrderCreate, OrderCreateResponse, OrderResponse, OrderStatusUpdate, ProductResponse,
 )
 from bladys.order_lifecycle import EXPECTED_STATUS, OrderStatus
@@ -273,16 +278,18 @@ def kitchen_pending_orders(session: Session = Depends(get_session)):
     "/orders/{order_id}/payment/proof", response_model=PaymentResponse,
     dependencies=[Depends(get_owned_order)],
 )
-def submit_payment_proof(
-    order_id: int, payload: PaymentProofSubmission,
+async def submit_payment_proof(
+    order_id: int, file: UploadFile,
     session: Session = Depends(get_session),
 ):
+    image_bytes = await read_and_validate_payment_proof(file)
+    proof_reference = save_payment_proof(image_bytes, file.content_type)
     # Ownership lookup has already started the shared session transaction.
     try:
         result = session.execute(
             update(Payment).where(
                 Payment.order_id == order_id, Payment.status == "PENDIENTE_COMPROBANTE",
-            ).values(status="PENDIENTE_VERIFICACION", proof_reference=payload.proof_reference)
+            ).values(status="PENDIENTE_VERIFICACION", proof_reference=proof_reference)
             .execution_options(synchronize_session=False)
         )
         payment = session.scalar(select(Payment).where(Payment.order_id == order_id)
@@ -294,7 +301,13 @@ def submit_payment_proof(
         response = PaymentResponse.model_validate(payment)
         session.commit()
     except Exception:
-        session.rollback()
+        try:
+            session.rollback()
+        finally:
+            try:
+                delete_payment_proof(proof_reference)
+            except OSError:
+                pass  # Best effort: preserve the database failure if deletion fails.
         raise
     return response
 
@@ -307,6 +320,24 @@ def payments_pending_verification(session: Session = Depends(get_session)):
     return session.scalars(select(Payment).where(
         Payment.status == "PENDIENTE_VERIFICACION",
     ).order_by(Payment.id)).all()
+
+
+@app.get(
+    "/payments/{payment_id}/proof", response_class=FileResponse,
+    dependencies=[Depends(require_role(UserRole.RECEPTION))],
+)
+def get_payment_proof(payment_id: int, session: Session = Depends(get_session)):
+    payment = session.get(Payment, payment_id)
+    if payment is None:
+        raise HTTPException(404, detail="El pago no existe")
+    if not payment.proof_reference:
+        raise HTTPException(404, detail="El comprobante no existe")
+    try:
+        path = resolve_payment_proof(payment.proof_reference)
+    except (OSError, ValueError, RuntimeError):
+        raise HTTPException(404, detail="El comprobante no existe") from None
+    media_type = {".jpg": "image/jpeg", ".png": "image/png"}[path.suffix]
+    return FileResponse(path, media_type=media_type)
 
 
 @app.patch(
