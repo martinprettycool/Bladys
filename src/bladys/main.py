@@ -1,6 +1,7 @@
 from decimal import Decimal
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Header, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Header, UploadFile, Form
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, selectinload
@@ -19,12 +20,11 @@ from bladys.models import Payment, Order, OrderItem, Product, ProductVariant, Id
 from bladys.schemas import (
     LoginRequest, TokenResponse, KitchenOrderStatusUpdate,
     PaymentDecision, PaymentResponse,
-    OrderCreate, OrderCreateResponse, OrderResponse, OrderStatusUpdate, ProductResponse,
+    OrderCreate, OrderReplace, OrderCreateResponse, OrderResponse, OrderStatusUpdate, ProductResponse,
 )
 from bladys.order_lifecycle import EXPECTED_STATUS, OrderStatus
-import hashlib
-import json
 from bladys.idempotency import build_request_hash
+from bladys.menu import ProductCategory, WING_FLAVORS
 
 app = FastAPI()
 
@@ -55,41 +55,42 @@ def get_products(session: Session = Depends(get_session)):
     return session.scalars(statement).all()
 
 
-def normalize_items(payload: OrderCreate) -> dict[int, int]:
-    quantities: dict[int, int] = {}
+def normalize_items(payload: OrderCreate) -> dict[tuple[int, tuple[str, ...]], int]:
+    quantities = {}
     for item in payload.items:
-        quantities[item.variant_id] = quantities.get(item.variant_id, 0) + item.quantity
+        if len(item.selected_flavors) != len(set(item.selected_flavors)):
+            raise HTTPException(422, detail="No se permiten sabores duplicados")
+        identity = (item.variant_id, tuple(sorted(item.selected_flavors)))
+        quantities[identity] = quantities.get(identity, 0) + item.quantity
     return quantities
 
 
-def build_order_items(session: Session, quantities: dict[int, int]):
+def build_order_items(session: Session, quantities):
     statement = (
-        select(ProductVariant, Product.is_available)
+        select(ProductVariant, Product)
         .join(ProductVariant.product)
-        .where(ProductVariant.id.in_(quantities))
+        .where(ProductVariant.id.in_({identity[0] for identity in quantities}))
     )
-    variants = {
-        variant.id: (variant, product_available)
-        for variant, product_available in session.execute(statement)
-    }
-
+    variants = {variant.id: (variant, product) for variant, product in session.execute(statement)}
     order_items = []
     total = Decimal("0.00")
-    for variant_id, quantity in quantities.items():
+    for (variant_id, flavors), quantity in quantities.items():
         if variant_id not in variants:
             raise HTTPException(404, detail=f"La variante {variant_id} no existe")
-
-        variant, product_available = variants[variant_id]
-        if not variant.is_available or not product_available:
+        variant, product = variants[variant_id]
+        if not variant.is_available or not product.is_available:
             raise HTTPException(400, detail=f"La variante {variant_id} no esta disponible")
-
+        if product.category == ProductCategory.ALITAS:
+            if (variant.max_flavors is None or not 1 <= len(flavors) <= variant.max_flavors
+                    or not set(flavors).issubset(WING_FLAVORS)):
+                raise HTTPException(422, detail=f"Seleccione entre 1 y {variant.max_flavors or 0} sabores válidos para la variante {variant_id}")
+        elif flavors:
+            raise HTTPException(422, detail="Solo las alitas permiten seleccionar sabores")
         order_items.append(OrderItem(
-            variant_id=variant_id,
-            quantity=quantity,
-            unit_price=variant.price,
+            variant_id=variant_id, quantity=quantity, unit_price=variant.price,
+            selected_flavors=list(flavors),
         ))
         total += variant.price * quantity
-
     return order_items, total
 
 
@@ -152,26 +153,57 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
     return response
 
 
+@app.get("/orders/{order_id}", response_model=OrderResponse)
+def get_order(order: Order = Depends(get_owned_order)):
+    return order
+
+
+def lock_order_payment(session: Session, order_id: int):
+    """All operations that write both rows acquire Order before Payment."""
+    order = session.scalar(
+        select(Order).where(Order.id == order_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if order is None:
+        raise HTTPException(404, detail="El pedido no existe")
+    payment = session.scalar(
+        select(Payment).where(Payment.order_id == order_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return order, payment
+
+
+def check_order_version(order: Order, expected_version: int):
+    if order.version != expected_version:
+        raise HTTPException(409, detail={
+            "code": "ORDER_VERSION_CONFLICT", "current_version": order.version,
+            "message": "El pedido cambio. Actualiza y revisa el total antes de continuar.",
+        })
+
+
+def check_unpaid_order(order: Order, payment: Payment | None):
+    if order.status != "PENDIENTE_ACEPTACION":
+        raise HTTPException(409, detail={"code": "ORDER_NOT_EDITABLE", "message": "El pedido ya no permite esta operacion"})
+    if payment is None:
+        raise HTTPException(409, detail={"code": "PAYMENT_MISSING", "message": "El pedido no tiene un pago asociado"})
+    if payment.status != "PENDIENTE_COMPROBANTE" or payment.proof_reference is not None:
+        raise HTTPException(409, detail={"code": "PAYMENT_NOT_EDITABLE", "message": "El pago ya no permite modificar el pedido ni enviar comprobantes"})
+
+
 @app.put(
     "/orders/{order_id}/items", response_model=OrderResponse,
     dependencies=[Depends(get_owned_order)],
 )
 def replace_order_items(
     order_id: int,
-    payload: OrderCreate,
+    payload: OrderReplace,
     session: Session = Depends(get_session),
 ):
     # Authorization has already started the shared session transaction.
     try:
-        # Lock before inspecting status; the kitchen UPDATE takes the same row lock.
-        order = session.scalar(
-            select(Order).where(Order.id == order_id).with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        if order is None:
-            raise HTTPException(404, detail="El pedido no existe")
-        if order.status != "PENDIENTE_ACEPTACION":
-            raise HTTPException(409, detail="El pedido ya no permite modificar items")
+        order, payment = lock_order_payment(session, order_id)
+        check_unpaid_order(order, payment)
+        check_order_version(order, payload.expected_version)
 
         items, total = build_order_items(session, normalize_items(payload))
         session.execute(delete(OrderItem).where(OrderItem.order_id == order_id))
@@ -179,6 +211,7 @@ def replace_order_items(
         session.expire(order, ["items"])
         order.items = items
         order.total = total
+        order.version += 1
         session.flush()
         response = OrderResponse.model_validate(order)
         session.commit()
@@ -280,12 +313,16 @@ def kitchen_pending_orders(session: Session = Depends(get_session)):
 )
 async def submit_payment_proof(
     order_id: int, file: UploadFile,
+    expected_version: Annotated[int, Form(gt=0)],
     session: Session = Depends(get_session),
 ):
     image_bytes = await read_and_validate_payment_proof(file)
     proof_reference = save_payment_proof(image_bytes, file.content_type)
     # Ownership lookup has already started the shared session transaction.
     try:
+        order, payment = lock_order_payment(session, order_id)
+        check_unpaid_order(order, payment)
+        check_order_version(order, expected_version)
         result = session.execute(
             update(Payment).where(
                 Payment.order_id == order_id, Payment.status == "PENDIENTE_COMPROBANTE",
@@ -349,6 +386,13 @@ def decide_payment(
     session: Session = Depends(get_session),
 ):
     try:
+        # This lookup takes no row lock. Recheck identity/state after locking.
+        order_id = session.scalar(select(Payment.order_id).where(Payment.id == payment_id))
+        if order_id is None:
+            raise HTTPException(404, detail="El pago no existe")
+        order, payment = lock_order_payment(session, order_id)
+        if payment is None or payment.id != payment_id:
+            raise HTTPException(404, detail="El pago no existe")
         result = session.execute(
             update(Payment).where(
                 Payment.id == payment_id, Payment.status == "PENDIENTE_VERIFICACION",

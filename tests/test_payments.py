@@ -35,7 +35,7 @@ def payment_order(seeded_order_client, engine):
 def submit(client, order_id, headers=None):
     if headers is None:
         headers = {"X-Order-Access-Token": create_order_access_token(order_id)}
-    return client.post(f"/orders/{order_id}/payment/proof", headers=headers,
+    return client.post(f"/orders/{order_id}/payment/proof", headers=headers, data={"expected_version": "1"},
                        files={"file": ("receipt.jpg", b"receipt bytes", "image/jpeg")})
 
 
@@ -228,6 +228,7 @@ def test_real_upload(client, payment_order, engine, mime, extension):
     response = client.post(
         f"/orders/{order_id}/payment/proof",
         headers={"X-Order-Access-Token": create_order_access_token(order_id)},
+        data={"expected_version": "1"},
         files={"file": ("untrusted.name", content, mime)},
     )
     assert response.status_code == 200
@@ -250,6 +251,7 @@ def test_invalid_upload_preserves_payment(client, payment_order, engine, proof_s
     response = client.post(
         f"/orders/{order_id}/payment/proof",
         headers={"X-Order-Access-Token": create_order_access_token(order_id)},
+        data={"expected_version": "1"},
         files={"file": ("proof", content, mime)},
     )
     assert response.status_code == expected
@@ -327,6 +329,7 @@ def test_reception_retrieves_proof(client, payment_order, staff_headers, mime):
     upload = client.post(
         f"/orders/{order_id}/payment/proof",
         headers={"X-Order-Access-Token": create_order_access_token(order_id)},
+        data={"expected_version": "1"},
         files={"file": ("receipt", content, mime)},
     )
     assert upload.status_code == 200

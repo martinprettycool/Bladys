@@ -246,9 +246,9 @@ def test_postgres_rejects_unsupported_order_status(postgres_session):
 def test_replacement_vs_preparation_row_lock(
     postgres_client, postgres_engine, postgres_session, postgres_order_variant_id, winner, postgres_staff_headers,
 ):
-    """Contexto: cliente modifica mientras cocina acepta el pedido.
-    GarantÃ­a: la modificaciÃ³n solo confirma antes de la aceptaciÃ³n.
-    Escenarios: gana primero la modificaciÃ³n o la cocina y la otra espera el bloqueo.
+    """Contexto: cliente intenta editar un pedido pagado mientras cocina lo acepta.
+    Garantia: la edicion se rechaza antes o despues de cocina sin cambiar total ni items.
+    Escenarios: cada operacion adquiere primero el bloqueo y la otra espera en PostgreSQL.
     """
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -279,7 +279,7 @@ def test_replacement_vs_preparation_row_lock(
             if "status" in context.compiled_parameters[0]:
                 return "kitchen"
         if statement is not None and getattr(statement, "is_select", False):
-            if getattr(statement, "_for_update_arg", None) is not None:
+            if getattr(statement, "_for_update_arg", None) is not None and statement.column_descriptions[0]["entity"] is Order:
                 return "modification"
         return None
 
@@ -299,7 +299,7 @@ def test_replacement_vs_preparation_row_lock(
     def modify():
         return postgres_client.put(f"/orders/{order_id}/items", headers={
             "X-Order-Access-Token": created.json()["order_access_token"],
-        }, json={"items": [
+        }, json={"expected_version": created.json()["version"], "items": [
             {"variant_id": postgres_order_variant_id, "quantity": 5}
         ]})
 
@@ -335,12 +335,15 @@ def test_replacement_vs_preparation_row_lock(
         event.remove(postgres_engine, "before_cursor_execute", before_execute)
         event.remove(postgres_engine, "after_cursor_execute", after_execute)
 
-    assert first_response.status_code == 200
-    assert second_response.status_code == (200 if winner == "modification" else 409)
+    modification_response = first_response if winner == "modification" else second_response
+    kitchen_response = second_response if winner == "modification" else first_response
+    assert modification_response.status_code == 409  # Approved payments prohibit editing.
+    assert modification_response.json()["detail"]["code"] in {"PAYMENT_NOT_EDITABLE", "ORDER_NOT_EDITABLE"}
+    assert kitchen_response.status_code == 200
     with Session(postgres_engine) as verification:
         persisted = verification.get(Order, order_id)
         assert persisted.status == "PREPARANDO"
-        quantity = 5 if winner == "modification" else 2
+        quantity = 2
         assert persisted.total == Decimal("3.00") * quantity
         assert [(i.variant_id, i.quantity, i.unit_price) for i in persisted.items] == [
             (postgres_order_variant_id, quantity, Decimal("3.00"))

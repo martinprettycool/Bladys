@@ -3,7 +3,13 @@ import json
 
 
 def canonicalize_order_intent(quantities):
-    return sorted(quantities.items())
+    # Keep the original serialization for flavorless orders, including existing keys.
+    lines = []
+    for identity, quantity in quantities.items():
+        variant_id, flavors = (identity, ()) if isinstance(identity, int) else identity
+        flavors = tuple(sorted(flavors))
+        lines.append((variant_id, quantity) if not flavors else (variant_id, quantity, flavors))
+    return sorted(lines)
 
 
 def build_request_hash(quantities):

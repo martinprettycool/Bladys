@@ -3,9 +3,12 @@ from decimal import Decimal
 from enum import StrEnum
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, DateTime, ForeignKey, Numeric, String, Text, func, true,
+    JSON, Boolean, CheckConstraint, DateTime, ForeignKey, Numeric, String, Text, func, true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+from bladys.menu import ProductCategory, WING_FLAVORS
 
 
 class Base(DeclarativeBase):
@@ -14,6 +17,16 @@ class Base(DeclarativeBase):
 
 class Product(Base):
     __tablename__ = "products"
+    __table_args__ = (
+        CheckConstraint("category IN ('PIZZA', 'HAMBURGUESA', 'ALITAS', 'PAPITAS')", name="ck_products_category"),
+    )
+
+    category: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    @property
+    def flavor_options(self) -> list[str]:
+        return list(WING_FLAVORS) if self.category == ProductCategory.ALITAS else []
+
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -31,9 +44,12 @@ class ProductVariant(Base):
     __tablename__ = "product_variants"
     __table_args__ = (
         CheckConstraint("price >= 0", name="ck_product_variants_price_nonnegative"),
+        CheckConstraint("max_flavors > 0", name="ck_product_variants_max_flavors_positive"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    max_flavors: Mapped[int | None] = mapped_column(nullable=True)
     product_id: Mapped[int] = mapped_column(
         ForeignKey("products.id", ondelete="RESTRICT"), nullable=False,
     )
@@ -53,6 +69,7 @@ class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
         CheckConstraint("total >= 0", name="ck_orders_total_nonnegative"),
+        CheckConstraint("version > 0", name="ck_orders_version_positive"),
         CheckConstraint(
             "status IN ('PENDIENTE_ACEPTACION', 'PREPARANDO', 'LISTO', "
             "'ENVIADO', 'RECHAZADO', 'CANCELADO')",
@@ -64,6 +81,7 @@ class Order(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default="PENDIENTE_ACEPTACION",
     )
+    version: Mapped[int] = mapped_column(nullable=False, server_default="1")
     total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
@@ -112,6 +130,9 @@ class OrderItem(Base):
     )
     quantity: Mapped[int] = mapped_column(nullable=False)
     unit_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    selected_flavors: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]",
+    )
 
     order: Mapped[Order] = relationship(back_populates="items")
     variant: Mapped[ProductVariant] = relationship(back_populates="items")

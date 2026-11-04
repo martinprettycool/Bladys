@@ -3,7 +3,8 @@
 import jwt
 from fastapi import Depends, Header, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, joinedload
 
 from bladys.database import get_session
 from bladys.models import Order, User, UserRole
@@ -61,7 +62,10 @@ def get_owned_order(
         raise unauthorized from None
     if token_order_id != order_id:
         raise HTTPException(status_code=403, detail="Order access denied")
-    order = session.get(Order, order_id)
+    # One database statement keeps items, total and version from the same snapshot.
+    order = session.execute(
+        select(Order).where(Order.id == order_id).options(joinedload(Order.items))
+    ).unique().scalar_one_or_none()
     if order is None:
         raise HTTPException(status_code=404, detail="Order not found")
     return order

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#faf3e6">
+  <meta name="description" content="Blady's Pizza — una buena pizza empieza aquí.">
+  <title>Blady's Pizza · Menú</title>
+  <link rel="stylesheet" href="./styles/tokens.css">
+  <link rel="stylesheet" href="./styles/app.css">
+  <script type="module" src="./src/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Saltar al contenido</a>
+  <header class="site-header">
+    <a href="#menu" data-brand>Blady&apos;s Pizza</a>
+    <nav aria-label="Cliente"><a href="#pizzas">Ver menú</a></nav>
+  </header>
+  <main id="main" tabindex="-1"></main>
+  <footer class="site-footer"><span class="footer-brand">Blady’s Pizza</span><span>Hecha para compartir.</span><details class="team-access"><summary>Equipo y recursos</summary><nav aria-label="Equipo y recursos"><a href="#reception">Recepción</a><a href="#kitchen">Cocina</a><a href="#foundation">Guía visual</a></nav></details></footer>
+  <dialog id="preview-dialog" aria-labelledby="dialog-title"></dialog>
+  <div id="cart-announcement" class="sr-only" role="status" aria-live="polite"></div>
+  <noscript><p class="notice">Activa JavaScript para explorar el menú y armar tu pedido.</p></noscript>
+</body>
+</html>

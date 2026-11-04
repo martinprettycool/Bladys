@@ -36,14 +36,14 @@ def assert_persisted(engine, order_id, items, total="6.00", status="PENDIENTE_AC
     ([(10, 1), (10, 3)], [(10, 4, Decimal("3.00"))], "12.00"),
 ])
 def test_replace_complete_contents(client, pending_order, engine, desired, expected, total):
-    response = client.put(f"/orders/{pending_order}/items", json={"items": [
+    response = client.put(f"/orders/{pending_order}/items", json={"expected_version": 1, "items": [
         {"variant_id": variant, "quantity": quantity} for variant, quantity in desired
     ]})
     assert response.status_code == 200
     assert response.json()["total"] == total
     assert_persisted(engine, pending_order, expected, total)
     # A second replacement removes every other variant.
-    assert client.put(f"/orders/{pending_order}/items", json={"items": [
+    assert client.put(f"/orders/{pending_order}/items", json={"expected_version": response.json()["version"], "items": [
         {"variant_id": 10, "quantity": 1}
     ]}).status_code == 200
     assert_persisted(engine, pending_order, [(10, 1, Decimal("3.00"))], "3.00")
@@ -57,13 +57,13 @@ def test_replace_complete_contents(client, pending_order, engine, desired, expec
     {"items": [{"variant_id": 10, "quantity": 1}], "total": "0.01"},
 ])
 def test_invalid_replacement(client, pending_order, engine, payload):
-    assert client.put(f"/orders/{pending_order}/items", json=payload).status_code == 422
+    assert client.put(f"/orders/{pending_order}/items", json={"expected_version": 1, **payload}).status_code == 422
     assert_persisted(engine, pending_order, [(10, 2, Decimal("3.00"))])
 
 
 @pytest.mark.parametrize("variant,status", [(999, 404), (12, 400), (20, 400)])
 def test_invalid_variant_preserves_order(client, pending_order, engine, variant, status):
-    response = client.put(f"/orders/{pending_order}/items", json={"items": [
+    response = client.put(f"/orders/{pending_order}/items", json={"expected_version": 1, "items": [
         {"variant_id": 11, "quantity": 3}, {"variant_id": variant, "quantity": 1}
     ]})
     assert response.status_code == status
@@ -73,7 +73,7 @@ def test_invalid_variant_preserves_order(client, pending_order, engine, variant,
 def test_missing_order(client):
     assert client.put("/orders/999/items", headers={
         "X-Order-Access-Token": create_order_access_token(999),
-    }, json={"items": [
+    }, json={"expected_version": 1, "items": [
         {"variant_id": 10, "quantity": 1}
     ]}).status_code == 404
 
@@ -83,7 +83,7 @@ def test_nonpending_replacement_rejected(client, pending_order, engine, status):
     with Session(engine) as setup:
         setup.get(Order, pending_order).status = status
         setup.commit()
-    assert client.put(f"/orders/{pending_order}/items", json={"items": [
+    assert client.put(f"/orders/{pending_order}/items", json={"expected_version": 1, "items": [
         {"variant_id": 11, "quantity": 1}
     ]}).status_code == 409
     assert_persisted(engine, pending_order, [(10, 2, Decimal("3.00"))], status=status)
@@ -93,7 +93,7 @@ def test_replacement_snapshots_current_price(client, pending_order, engine):
     with Session(engine) as setup:
         setup.get(ProductVariant, 10).price = Decimal("4.25")
         setup.commit()
-    response = client.put(f"/orders/{pending_order}/items", json={"items": [
+    response = client.put(f"/orders/{pending_order}/items", json={"expected_version": 1, "items": [
         {"variant_id": 10, "quantity": 3}
     ]})
     assert response.status_code == 200
@@ -115,7 +115,7 @@ def test_insert_failure_rolls_back_replacement(client, pending_order, engine):
     event.listen(OrderItem, "before_insert", fail_insert)
     try:
         with pytest.raises(RuntimeError, match="replacement insert failure"):
-            client.put(f"/orders/{pending_order}/items", json={"items": [
+            client.put(f"/orders/{pending_order}/items", json={"expected_version": 1, "items": [
                 {"variant_id": 11, "quantity": 3}
             ]})
     finally:
@@ -143,7 +143,7 @@ def test_replacement_requires_matching_order_token(client, pending_order, engine
         headers["X-Order-Access-Token"] = token
         target_id = other_id
     response = client.put(f"/orders/{target_id}/items", headers=headers, json={
-        "items": [{"variant_id": 11, "quantity": 5}],
+        "expected_version": 1, "items": [{"variant_id": 11, "quantity": 5}],
     })
     assert response.status_code == (403 if credential == "other_order" else 401)
     assert_persisted(engine, pending_order, [(10, 2, Decimal("3.00"))])

@@ -50,8 +50,8 @@ def test_order_lifecycle_transitions(client, session, engine, source, target, st
         assert persisted.items[0].unit_price == Decimal("3.00")
     if valid:
         assert response.json() == {
-            "id": order_id, "status": target, "total": "6.00",
-            "items": [{"variant_id": variant.id, "quantity": 2, "unit_price": "3.00"}],
+            "id": order_id, "version": 1, "status": target, "total": "6.00",
+            "items": [{"variant_id": variant.id, "quantity": 2, "unit_price": "3.00", "selected_flavors": []}],
         }
     else:
         assert f"{source} -> {target}" in response.json()["detail"]

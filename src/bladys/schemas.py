@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from bladys.menu import ProductCategory
 from bladys.order_lifecycle import OrderStatus
 from bladys.payment_lifecycle import PaymentStatus
 
@@ -13,6 +14,9 @@ class ProductVariantResponse(BaseModel):
     id: int
     name: str
     price: Decimal
+    description: str | None
+    is_available: bool
+    max_flavors: int | None
 
 
 class ProductResponse(BaseModel):
@@ -21,6 +25,9 @@ class ProductResponse(BaseModel):
     id: int
     name: str
     description: str | None
+    category: ProductCategory | None
+    is_available: bool
+    flavor_options: list[str]
     variants: list[ProductVariantResponse]
 
 
@@ -29,6 +36,7 @@ class OrderItemCreate(BaseModel):
 
     variant_id: int
     quantity: int = Field(gt=0, strict=True)
+    selected_flavors: list[str] = Field(default_factory=list)
 
 
 class OrderCreate(BaseModel):
@@ -37,12 +45,17 @@ class OrderCreate(BaseModel):
     items: list[OrderItemCreate] = Field(min_length=1)
 
 
+class OrderReplace(OrderCreate):
+    expected_version: int = Field(gt=0, strict=True)
+
+
 class OrderItemResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     variant_id: int
     quantity: int
     unit_price: Decimal
+    selected_flavors: list[str]
 
 
 class OrderStatusUpdate(BaseModel):
@@ -61,6 +74,7 @@ class OrderResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    version: int
     status: OrderStatus
     total: Decimal
     items: list[OrderItemResponse]

@@ -43,10 +43,10 @@ def test_create_order_consolidates_and_snapshots_prices(seeded_order_client, eng
     assert isinstance(body["order_access_token"], str)
     assert body == {
         "order_access_token": body["order_access_token"],
-        "id": body["id"], "status": "PENDIENTE_ACEPTACION", "total": "22.25",
+        "id": body["id"], "version": 1, "status": "PENDIENTE_ACEPTACION", "total": "22.25",
         "items": [
-            {"variant_id": 10, "quantity": 5, "unit_price": "3.00"},
-            {"variant_id": 11, "quantity": 1, "unit_price": "7.25"},
+            {"variant_id": 10, "quantity": 5, "unit_price": "3.00", "selected_flavors": []},
+            {"variant_id": 11, "quantity": 1, "unit_price": "7.25", "selected_flavors": []},
         ],
     }
     with Session(engine) as session:

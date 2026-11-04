@@ -41,9 +41,9 @@ def test_available_products_and_variants(client, session):
     assert response.status_code == 200
     assert response.json() == [
         {
-            "id": 1, "name": "Pizza Italiana", "description": "Pizza",
-            "variants": [{"id": 10, "name": "Personal", "price": "3.00"}],
+            "id": 1, "name": "Pizza Italiana", "description": "Pizza", "category": None, "is_available": True, "flavor_options": [],
+            "variants": [{"id": 10, "name": "Personal", "price": "3.00", "description": None, "is_available": True, "max_flavors": None}],
         },
-        {"id": 3, "name": "No variants", "description": None, "variants": []},
-        {"id": 4, "name": "Only hidden variants", "description": None, "variants": []},
+        {"id": 3, "name": "No variants", "description": None, "category": None, "is_available": True, "flavor_options": [], "variants": []},
+        {"id": 4, "name": "Only hidden variants", "description": None, "category": None, "is_available": True, "flavor_options": [], "variants": []},
     ]
