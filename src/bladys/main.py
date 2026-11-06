@@ -158,6 +158,14 @@ def get_order(order: Order = Depends(get_owned_order)):
     return order
 
 
+@app.get("/orders/{order_id}/payment", response_model=PaymentResponse)
+def get_order_payment(order: Order = Depends(get_owned_order), session: Session = Depends(get_session)):
+    payment = session.scalar(select(Payment).where(Payment.order_id == order.id))
+    if payment is None:
+        raise HTTPException(404, detail="El pago no existe")
+    return payment
+
+
 def lock_order_payment(session: Session, order_id: int):
     """All operations that write both rows acquire Order before Payment."""
     order = session.scalar(
@@ -296,6 +304,20 @@ def update_kitchen_order_status(
 
 
 @app.get(
+    "/kitchen/orders", response_model=list[OrderResponse],
+    dependencies=[Depends(require_role(UserRole.KITCHEN))],
+)
+def kitchen_active_orders(session: Session = Depends(get_session)):
+    """Recover the operational queue across refreshes and staff sessions."""
+    return session.scalars(
+        select(Order).join(Payment).where(
+            Order.status.in_(("PENDIENTE_ACEPTACION", "PREPARANDO", "LISTO")),
+            Payment.status == "APROBADO",
+        ).options(selectinload(Order.items)).order_by(Order.id)
+    ).all()
+
+
+@app.get(
     "/kitchen/orders/pending", response_model=list[OrderResponse],
     dependencies=[Depends(require_role(UserRole.KITCHEN))],
 )
@@ -413,3 +435,16 @@ def decide_payment(
         session.rollback()
         raise
     return response
+
+
+@app.get(
+    "/reception/orders/{order_id}", response_model=OrderResponse,
+    dependencies=[Depends(require_role(UserRole.RECEPTION))],
+)
+def reception_order(order_id: int, session: Session = Depends(get_session)):
+    order = session.execute(
+        select(Order).where(Order.id == order_id).options(selectinload(Order.items))
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(404, detail="El pedido no existe")
+    return order

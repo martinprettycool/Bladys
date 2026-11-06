@@ -26,4 +26,8 @@ def session_override():
     with Session(engine) as session:
         yield session
 app.dependency_overrides[get_session] = session_override
-uvicorn.run(app, host="127.0.0.1", port=8174, log_level="warning")
+# Proof files belong to the disposable test environment too.
+from tempfile import TemporaryDirectory
+with TemporaryDirectory(prefix="bladys-browser-proofs-") as proof_directory:
+    os.chdir(proof_directory)
+    uvicorn.run(app, host="127.0.0.1", port=8174, log_level="warning")

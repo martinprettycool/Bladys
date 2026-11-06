@@ -1,7 +1,7 @@
 // Same-origin by default; production hosting must proxy these routes to FastAPI.
 export class ApiError extends Error {
-  constructor(message, { status = 0, uncertain = false } = {}) {
-    super(message); this.status = status; this.uncertain = uncertain;
+  constructor(message, { status = 0, uncertain = false, code = null, currentVersion = null } = {}) {
+    super(message); this.status = status; this.uncertain = uncertain; this.code = code; this.currentVersion = currentVersion;
   }
 }
 const base = () => (globalThis.document?.querySelector('meta[name="api-base"]')?.content || '').replace(/\/$/, '');
@@ -32,7 +32,7 @@ export async function request(path, { timeout = 15000, fetchImpl = globalThis.fe
       };
       const detail = typeof body.detail === 'string' && response.status < 500 ? ' ' + body.detail : '';
       throw new ApiError((messages[response.status] || 'El restaurante no pudo procesar la solicitud.') + detail,
-        { status: response.status, uncertain: response.status >= 500 || response.status === 408 });
+        { status: response.status, uncertain: response.status >= 500 || response.status === 408, code: body.detail?.code, currentVersion: body.detail?.current_version });
     }
     return body;
   } catch (error) {
@@ -60,4 +60,30 @@ export async function getOrder(id, token, options = {}) {
   const order = await request('/orders/' + id, { ...options, headers: { Accept: 'application/json', 'X-Order-Access-Token': token } });
   if (!validOrder(order) || order.id !== id) throw new ApiError('No pudimos verificar el pedido.');
   return order;
+}
+
+export async function getOrderPayment(id, token, options = {}) {
+  const payment = await request(`/orders/${id}/payment`, { ...options, headers: { Accept: 'application/json', 'X-Order-Access-Token': token } });
+  if (payment.order_id !== id || !['PENDIENTE_COMPROBANTE', 'PENDIENTE_VERIFICACION', 'APROBADO', 'RECHAZADO'].includes(payment.status)
+      || !(payment.proof_reference === null || typeof payment.proof_reference === 'string')) throw new ApiError('No pudimos verificar el pago.');
+  return payment;
+}
+export async function replaceOrder(id, token, payload, options = {}) {
+  const order = await request(`/orders/${id}/items`, { ...options, method: 'PUT', headers: {
+    Accept: 'application/json', 'Content-Type': 'application/json', 'X-Order-Access-Token': token,
+  }, body: JSON.stringify(payload) });
+  if (!validOrder(order) || order.id !== id || !Number.isSafeInteger(order.version) || order.version !== payload.expected_version + 1)
+    throw new ApiError('No pudimos verificar la modificación. Consulta el pedido.', { uncertain: true });
+  return order;
+}
+
+export async function uploadOrderProof(id, token, file, expectedVersion, options = {}) {
+  const body = new FormData();
+  body.append('file', file, file.name);
+  body.append('expected_version', String(expectedVersion));
+  const payment = await request(`/orders/${id}/payment/proof`, { ...options, method: 'POST',
+    headers: { Accept: 'application/json', 'X-Order-Access-Token': token }, body });
+  if (payment.order_id !== id || payment.status !== 'PENDIENTE_VERIFICACION' || typeof payment.proof_reference !== 'string' || !payment.proof_reference)
+    throw new ApiError('No pudimos verificar el comprobante. Consulta el estado del pago.', { uncertain: true });
+  return payment;
 }

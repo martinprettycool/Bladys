@@ -257,3 +257,42 @@ dialog p { margin-top: 0; }
 .checkout-payment p { font-size: .875rem; margin-top: .75rem; }
 body[data-surface="checkout"] .site-header nav, body[data-surface="my-order"] .site-header nav { gap: .5rem; }
 body[data-surface="checkout"] .site-header nav a, body[data-surface="my-order"] .site-header nav a { font-size: .75rem; }
+
+/* Customer orders share the existing mobile checkout surface. */
+.guest-order { margin-block: var(--space-4, 1rem); min-width: 0; }
+.guest-order .checkout-item-copy, .checkout-shell .cart-item-copy { overflow-wrap: anywhere; min-width: 0; }
+.checkout-shell .section-stack { margin-block: 1.5rem; }
+.checkout-shell .checkout-actions { flex-wrap: wrap; }
+.checkout-shell button { white-space: normal; }
+@media (max-width: 480px) {
+  .checkout-shell .checkout-actions > * { width: 100%; }
+  .site-header nav { gap: .5rem; }
+  .site-header nav a { font-size: .875rem; }
+}
+
+.proof-panel { margin-block-start: 1.5rem; min-width: 0; }
+.proof-panel .field { margin-block: 1rem; }
+.proof-panel input[type=file] { max-width: 100%; min-width: 0; }
+.proof-filename { overflow-wrap: anywhere; }
+.proof-preview { display: block; width: 100%; max-width: 24rem; max-height: 20rem; object-fit: contain; margin-block: 1rem; border-radius: .75rem; }
+.proof-review { display: flex; align-items: flex-start; gap: .75rem; margin-block: 1rem; }
+.proof-review input { flex: 0 0 auto; margin-block-start: .25rem; }
+.proof-panel .button { margin-block: .5rem; }
+
+
+/* Reception uses the shared tokens without changing customer or kitchen layouts. */
+.reception-workspace { max-width: var(--width-staff); margin: auto; padding: var(--space-5) var(--space-4); overflow-wrap: anywhere; }
+.reception-workspace > .card { margin-top: var(--space-5); display: grid; gap: var(--space-3); }
+.reception-workspace > button { margin: var(--space-2) var(--space-2) var(--space-2) 0; }
+.reception-workspace form { max-width: 28rem; display: grid; gap: var(--space-4); margin-top: var(--space-5); }
+.reception-workspace img { display: block; margin: auto; }
+
+/* Operational kitchen layout. */
+.kitchen-workspace { max-width: 1100px; margin: auto; }
+.kitchen-workspace form { max-width: 440px; display: grid; gap: 16px; }
+.kitchen-orders { display: grid; gap: 18px; margin-top: 18px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); }
+.kitchen-orders .card { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.kitchen-orders li { margin-bottom: 12px; overflow-wrap: anywhere; font-size: 1.1rem; }
+.kitchen-orders .button { min-height: 56px; width: 100%; margin-top: auto; }
+.kitchen-status { font-weight: 700; overflow-wrap: anywhere; }
+.kitchen-workspace > .input { max-width: 100%; }

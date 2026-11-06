@@ -6,12 +6,12 @@ const fingerprint = payload => JSON.stringify(payload.items.map(i => [i.variant_
 
 // Submitted payload/key/labels are immutable; only the attempt status changes.
 export function createCheckout({ cart, send, storage, keyFactory = () => crypto.randomUUID() }) {
-  let attempt = null, receipt = null, busy = false, inFlight = null, error = null, storageWarning = false;
+  let attempt = null, receipt = null, receipts = [], busy = false, inFlight = null, error = null, storageWarning = false;
   const listeners = new Set();
   const notify = () => listeners.forEach(fn => fn());
   const store = (overrides = {}) => {
     try {
-      storage().setItem(SESSION_KEY, JSON.stringify({ cart: cart.items, attempt, receipt, ...overrides }));
+      storage().setItem(SESSION_KEY, JSON.stringify({ cart: cart.items, attempt, receipt, receipts, ...overrides }));
       storageWarning = false; return true;
     } catch { storageWarning = true; return false; }
   };
@@ -19,6 +19,12 @@ export function createCheckout({ cart, send, storage, keyFactory = () => crypto.
     const saved = JSON.parse(storage().getItem(SESSION_KEY) || 'null');
     if (saved) {
       if (validOrder(saved.receipt?.order) && typeof saved.receipt.token === 'string' && saved.receipt.token) receipt = saved.receipt;
+      for (const entry of [...(Array.isArray(saved.receipts) ? saved.receipts : []), ...(receipt ? [receipt] : [])]) {
+        if (validOrder(entry?.order) && typeof entry.token === 'string' && entry.token) {
+          const index = receipts.findIndex(r => r.order.id === entry.order.id);
+          if (index < 0) receipts.push(entry); else receipts[index] = entry;
+        }
+      }
       if (typeof saved.attempt?.key === 'string' && saved.attempt.key
           && fingerprint(saved.attempt.payload) === saved.attempt.fingerprint) {
         attempt = clone(saved.attempt);
@@ -76,6 +82,8 @@ export function createCheckout({ cart, send, storage, keyFactory = () => crypto.
         if (!validOrder(result) || typeof result.order_access_token !== 'string' || !result.order_access_token) throw new ApiError('Respuesta incompleta.', { uncertain: true });
         const { order_access_token: token, ...order } = result;
         receipt = { order, token, items: submitted.items };
+        const index = receipts.findIndex(r => r.order.id === order.id);
+        if (index < 0) receipts.push(receipt); else receipts[index] = receipt;
         attempt.status = 'confirmed'; attempt.orderId = order.id;
         return saveConfirmed();
       } catch (failure) {
@@ -88,14 +96,21 @@ export function createCheckout({ cart, send, storage, keyFactory = () => crypto.
     return inFlight;
   }
   return {
+    get receipts() { return clone(receipts); },
     get busy() { return busy; }, get error() { return error; }, get receipt() { return receipt; },
     get pending() { return Boolean(attempt); }, get storageWarning() { return storageWarning; },
     get confirmedRecovery() { return attempt?.status === 'confirmed'; },
     get reviewItems() { return clone(attempt ? attempt.items : cart.items); },
     get draftDiffers() { return Boolean(attempt && attempt.fingerprint !== fingerprint(cart.payload())); },
     subscribe(fn) { listeners.add(fn); fn(); return () => listeners.delete(fn); }, cartChanged, submit,
-    updateOrder(order) {
-      if (receipt && validOrder(order) && receipt.order.id === order.id) { receipt.order = clone(order); store(); notify(); }
+    updateOrder(order, labels) {
+      if (!validOrder(order)) return;
+      const entry = receipts.find(r => r.order.id === order.id);
+      if (!entry) return;
+      entry.order = clone(order);
+      if (labels) entry.items = clone(labels);
+      if (receipt?.order.id === order.id) receipt = entry;
+      store(); notify();
     },
   };
 }

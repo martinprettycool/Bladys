@@ -36,6 +36,7 @@ try {
   const pending = new Map();
   let mode = 'real';
   let checkoutMode = 'real';
+  let proofMode = 'real', proofRequests = 0;
   const orderKeys = [];
   const errors = [];
   function send(method, params = {}) {
@@ -51,7 +52,22 @@ try {
     } else if (message.method === 'Runtime.exceptionThrown') errors.push(message.params.exceptionDetails.text);
     else if (message.method === 'Fetch.requestPaused') {
       const requestId = message.params.requestId;
-      if (new URL(message.params.request.url).pathname === '/orders') {
+      if (new URL(message.params.request.url).pathname.endsWith('/payment/proof')) {
+        const responseStage = message.params.responseStatusCode !== undefined;
+        if (!responseStage) proofRequests++;
+        if (proofMode === 'stale' && !responseStage) {
+          proofMode = 'real';
+          const path = new URL(message.params.request.url).pathname.replace('/payment/proof', '');
+          const headers = { 'X-Order-Access-Token': message.params.request.headers['X-Order-Access-Token'] };
+          const order = await (await fetch('http://127.0.0.1:8174' + path, {headers})).json();
+          const items = order.items.map(({unit_price,...item}) => item); items[0].quantity++;
+          const changed = await fetch('http://127.0.0.1:8174' + path + '/items', {method:'PUT',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({expected_version:order.version,items})});
+          assert.equal(changed.status, 200);
+          await send('Fetch.continueRequest', { requestId });
+        } else if (proofMode === 'lose-response' && responseStage) {
+          proofMode = 'real'; await send('Fetch.failRequest', { requestId, errorReason: 'ConnectionClosed' });
+        } else await send('Fetch.continueRequest', { requestId });
+      } else if (new URL(message.params.request.url).pathname === '/orders') {
         const responseStage = message.params.responseStatusCode !== undefined;
         if (!responseStage) orderKeys.push(message.params.request.headers['Idempotency-Key']);
         if (checkoutMode === 'reject' && !responseStage) {
@@ -70,7 +86,7 @@ try {
   });
   await send('Runtime.enable');
   await send('Page.enable');
-  await send('Fetch.enable', { patterns: [{ urlPattern: '*/products' }, { urlPattern: '*/orders', requestStage: 'Request' }, { urlPattern: '*/orders', requestStage: 'Response' }] });
+  await send('Fetch.enable', { patterns: [{ urlPattern: '*/products' }, { urlPattern: '*/orders', requestStage: 'Request' }, { urlPattern: '*/orders', requestStage: 'Response' }, { urlPattern: '*/payment/proof', requestStage: 'Request' }, { urlPattern: '*/payment/proof', requestStage: 'Response' }] });
   const evaluate = async expression => {
     const result = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
     if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
@@ -81,6 +97,7 @@ try {
     throw new Error('Condition failed: ' + expression);
   }
   const shot = async name => {
+    if (process.argv.includes('--proof') && !name.startsWith('proof-')) return;
     const result = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
     await writeFile(join(output, name + '.png'), Buffer.from(result.data, 'base64'));
   };
@@ -140,7 +157,8 @@ try {
   await until(`!document.querySelector('dialog').open`);
   assert.equal(await evaluate(`document.activeElement === document.querySelector('.site-header button')`), true);
   await evaluate(`document.querySelector('dialog').close(); location.hash='reception'`);
-  await until(`!!document.querySelector('.staff-shell')`);
+  await until(`!!document.querySelector('#staff-user')`);
+  assert.equal(await evaluate(`document.querySelectorAll('.reception-workspace .card').length`), 0);
   await evaluate(`location.hash='menu'`);
   await until(`document.querySelectorAll('.category-card').length === 4`);
   assert.equal(await evaluate(`document.querySelector('.site-header button').textContent.includes('(3)')`), true);
@@ -194,6 +212,132 @@ try {
   await until(`!document.querySelector('.checkout-actions button').disabled`);
   assert.equal(await evaluate(`!!document.querySelector('.checkout-error')`), false);
   console.log('PASS actual POST /orders, selected flavors, server total/ID, guest access header and reload');
+  if (process.argv.includes('--orders')) {
+    // Contexto: dos compras invitadas y ediciones desde la pantalla móvil.
+    // Garantía: capacidades separadas, control de versión y protección tras comprobante.
+    // Escenarios: A/B, recarga, edición, conflicto externo y token inválido.
+    await evaluate(`location.hash='menu'`);
+    await until(`!!document.querySelector('#category-pizza button')`);
+    await evaluate(`document.querySelector('#category-pizza button').click(); document.querySelector('input[name=variant]').click(); document.querySelector('.sheet-submit').click(); document.querySelector('.site-header button').click(); document.querySelector('.checkout-start').click()`);
+    await until(`!!document.querySelector('[data-confirm-order]')`);
+    await evaluate(`document.querySelector('[data-confirm-order]').click()`);
+    await until(`location.hash === '#my-order' && !!document.querySelector('.confirmed-total')`);
+    const bId = await evaluate(`JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1')).receipt.order.id`);
+    assert.notEqual(bId, confirmed.id);
+    await evaluate(`location.hash='orders'`);
+    await until(`document.querySelectorAll('.guest-order').length === 2`);
+    await send('Page.reload');
+    await until(`document.querySelectorAll('.guest-order').length === 2 && !document.querySelector('.checkout-actions button').disabled`);
+    await shot('my-orders-390');
+    await evaluate(`document.querySelector('[data-order-id="${confirmed.id}"] button').click()`);
+    await until(`!!Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Modificar pedido' && !b.disabled)`);
+    await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Modificar pedido').click()`);
+    await until(`!!Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Guardar modificaciones')`);
+    await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Cambiar opci\u00f3n').click(); document.querySelectorAll('input[name=variant]')[1].click(); document.querySelector('.sheet-submit').click()`);
+    // Add valid Alitas to this draft, then remove that added line.
+    const draftLines = await evaluate(`document.querySelectorAll('.cart-item').length`);
+    await evaluate(`Array.from(document.querySelectorAll('.section-stack button')).find(b=>b.textContent==='Alitas').click(); document.querySelector('input[name=variant]').click(); document.querySelector('input[type=checkbox]').click(); document.querySelector('.sheet-submit').click()`);
+    assert.equal(await evaluate(`document.querySelectorAll('.cart-item').length`), draftLines + 1);
+    await evaluate(`Array.from(document.querySelectorAll('.cart-item')).at(-1).querySelector('.button-quiet').click()`);
+    assert.equal(await evaluate(`document.querySelectorAll('.cart-item').length`), draftLines);
+    await evaluate(`document.querySelector('.quantity-control button:last-child').click()`);
+    await shot('order-edit-390');
+    assert.equal(await evaluate(`document.documentElement.scrollWidth <= innerWidth`), true);
+    await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Guardar modificaciones').click()`);
+    await until(`!!Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Modificar pedido' && !b.disabled)`);
+    const edited = await evaluate(`JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1')).receipts.map(r=>({id:r.order.id,version:r.order.version,total:r.order.total}))`);
+    assert.equal(edited.find(o=>o.id===confirmed.id).version, 2);
+    assert.equal(edited.find(o=>o.id===bId).version, 1);
+    await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Modificar pedido').click()`);
+    await until(`!!Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Guardar modificaciones')`);
+    await evaluate(`document.querySelector('.quantity-control button:last-child').click()`);
+    assert.equal(await evaluate(`(async()=>{const r=JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1')).receipts.find(r=>r.order.id===${confirmed.id});const response=await fetch('/orders/'+r.order.id+'/items',{method:'PUT',headers:{'Content-Type':'application/json','X-Order-Access-Token':r.token},body:JSON.stringify({expected_version:r.order.version,items:r.order.items.map(({unit_price,...i})=>i)})});return response.status})()`), 200);
+    await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Guardar modificaciones').click()`);
+    await until(`!!document.querySelector('[role=alert]') && document.querySelector('[role=alert]').textContent.includes('borrador')`);
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Guardar modificaciones').disabled`), true);
+    await shot('order-conflict-390');
+    await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Actualizar pedido actual').click()`);
+    await until(`!!Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Actualizar pedido actual' && !b.disabled)`);
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Guardar modificaciones').disabled`), true);
+    await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Descartar borrador y volver').click()`);
+    if (process.argv.includes('--proof')) {
+      // Contexto: el invitado transfiere y adjunta imagenes desde el detalle movil.
+      // Garantia: se conserva ID/total/accesos y no se edita un pedido con comprobante.
+      // Escenarios: archivo invalido, 5 MB, version obsoleta y respuesta perdida.
+      await until(`!!document.querySelector('#proof-file')`);
+      await evaluate(`globalThis.chooseProof = async (type='image/png',size=0) => {
+        const canvas=document.createElement('canvas');canvas.width=320;canvas.height=480;
+        const ctx=canvas.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,320,480);ctx.fillStyle='black';ctx.fillText('Comprobante de prueba',30,40);
+        const blob=await new Promise(resolve=>canvas.toBlob(resolve,type));
+        const parts=size ? [blob,new Uint8Array(Math.max(0,size-blob.size))] : [blob];
+        const f=new File(parts,type==='image/png'?'recibo.png':'recibo.jpg',{type});
+        const data=new DataTransfer();data.items.add(f);const input=document.querySelector('#proof-file');input.files=data.files;input.dispatchEvent(new Event('change',{bubbles:true}));
+      }`);
+      await evaluate(`const data=new DataTransfer();data.items.add(new File(['pdf'],'invalid.pdf',{type:'application/pdf'}));const input=document.querySelector('#proof-file');input.files=data.files;input.dispatchEvent(new Event('change',{bubbles:true}))`);
+      await until(`document.querySelector('.proof-error')?.textContent.includes('JPG o PNG')`);
+      await evaluate(`chooseProof('image/png',5242881)`);
+      await until(`document.querySelector('.proof-error')?.textContent.includes('5 MB')`);
+      assert.equal(proofRequests, 0);
+      await evaluate(`chooseProof('image/png')`);
+      await until(`document.querySelector('.proof-preview')?.naturalWidth===320`);
+      assert.equal(await evaluate(`document.querySelector('.proof-submit').disabled`), true);
+      await evaluate(`document.querySelector('#proof-reviewed').click()`);
+      await evaluate(`document.querySelector('.proof-panel').scrollIntoView({block:'start'})`);
+      assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`), true);
+      await shot('proof-selection-390');
+      proofMode = 'stale';
+      await evaluate(`document.querySelector('.proof-submit').click()`);
+      await until(`!!document.querySelector('.proof-error') && document.querySelector('.proof-error').textContent.includes('total actual')`);
+      assert.equal(proofRequests, 1);
+      assert.equal(await evaluate(`document.querySelector('#proof-reviewed').checked`), false);
+      assert.equal(await evaluate(`document.querySelector('.proof-submit').disabled`), true);
+      await shot('proof-conflict-390');
+      const beforeProof = await evaluate(`(()=>{const r=JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1')).receipts.find(r=>r.order.id===${confirmed.id});return {id:r.order.id,total:r.order.total,version:r.order.version}})()`);
+      assert.equal(beforeProof.version, 4);
+      await evaluate(`document.querySelector('#proof-reviewed').click();document.querySelector('.proof-submit').click()`);
+      await until(`document.querySelector('.proof-payment-status')?.textContent.includes('PENDIENTE VERIFICACION')`);
+      assert.equal(proofRequests, 2);
+      assert.equal(await evaluate(`!!document.querySelector('.proof-submit')`), false);
+      assert.equal(await evaluate(`(async()=>{const r=JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1')).receipts.find(r=>r.order.id===${confirmed.id});const headers={'X-Order-Access-Token':r.token};const response=await fetch('/orders/'+r.order.id+'/items',{method:'PUT',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({expected_version:r.order.version,items:r.order.items.map(({unit_price,...i})=>i)})});return response.status})()`), 409);
+      await evaluate(`document.querySelector('.proof-panel').scrollIntoView({block:'start'})`);await shot('proof-received-390');
+      await send('Page.reload');
+      await until(`document.querySelectorAll('.guest-order').length===2 && !document.querySelector('.checkout-actions button').disabled`);
+      await evaluate(`document.querySelector('[data-order-id="${confirmed.id}"] button').click()`);
+      await until(`document.querySelector('.proof-payment-status')?.textContent.includes('PENDIENTE VERIFICACION')`);
+      const afterProof = await evaluate(`(()=>{const r=JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1')).receipts.find(r=>r.order.id===${confirmed.id});return {id:r.order.id,total:r.order.total,version:r.order.version}})()`);
+      assert.deepEqual(afterProof,beforeProof);
+      assert.equal(await evaluate(`document.querySelectorAll('[data-order-id] button')[0].disabled`),true);
+      await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Ver todos mis pedidos').click();document.querySelector('[data-order-id="${bId}"] button').click()`);
+      await until(`!!document.querySelector('#proof-file')`);
+      // The helper is recreated after reload, using the same real canvas image.
+      await evaluate(`globalThis.chooseJpeg = async () => { const canvas=document.createElement('canvas');canvas.width=320;canvas.height=480;const ctx=canvas.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,320,480);const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg'));const data=new DataTransfer();data.items.add(new File([blob,new Uint8Array(5242880-blob.size)],'transferencia.jpg',{type:'image/jpeg'}));const input=document.querySelector('#proof-file');input.files=data.files;input.dispatchEvent(new Event('change',{bubbles:true})); };chooseJpeg()`);
+      await until(`document.querySelector('.proof-preview')?.naturalWidth===320`);
+      proofMode = 'lose-response';
+      await evaluate(`document.querySelector('#proof-reviewed').click();document.querySelector('.proof-submit').click()`);
+      await until(`document.querySelector('.proof-payment-status')?.textContent.includes('PENDIENTE VERIFICACION') && !!document.querySelector('.proof-notice')`);
+      assert.equal(proofRequests, 3);
+      assert.equal(await evaluate(`document.querySelector('.proof-notice').textContent.includes('El servidor registra')`),true);
+      assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1')).receipts.length`),2);
+      await evaluate(`document.querySelector('.proof-panel').scrollIntoView({block:'start'})`);await shot('proof-uncertain-reconciled-390');
+      await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Ver todos mis pedidos').click();document.querySelector('[data-order-id="${confirmed.id}"] button').click()`);
+      await until(`!!document.querySelector('.proof-panel')`);
+      console.log('PASS real PNG and 5 MB JPEG through multipart proxy; invalid files blocked; stale upload 409; lost response reconciled; total/ID/accesses preserved; edit rejected; reload verified');
+    } else {
+    const proofAccess = await evaluate(`(()=>{const r=JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1')).receipts.find(r=>r.order.id===${confirmed.id});return {id:r.order.id,token:r.token,version:r.order.version}})()`);
+    const proofForm = new FormData(); proofForm.append('expected_version', String(proofAccess.version)); proofForm.append('file', new Blob(['test-proof'], {type:'image/jpeg'}), 'proof.jpg');
+    const proofResult = await fetch(`http://127.0.0.1:8174/orders/${proofAccess.id}/payment/proof`, {method:'POST', headers:{'X-Order-Access-Token':proofAccess.token}, body:proofForm});
+    assert.equal(proofResult.status, 200);
+    }
+    await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Actualizar estado').click()`);
+    await until(`!!Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Actualizar estado' && !b.disabled)`);
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Modificar pedido').disabled`), true);
+    await shot('order-paid-390');
+    await evaluate(`const saved=JSON.parse(sessionStorage.getItem('bladys.guest-checkout.v1'));saved.receipts.find(r=>r.order.id===${confirmed.id}).token='invalid';sessionStorage.setItem('bladys.guest-checkout.v1',JSON.stringify(saved))`);
+    await send('Page.reload');
+    await until(`!!document.querySelector('[role=alert]')`);
+    assert.equal(await evaluate(`document.body.textContent.includes('expiró')`), true);
+    console.log('PASS orders A/B retained after reload; edit A preserves B and ID, updates version; stale conflict blocked; proof disables editing; invalid capability handled at 390x844');
+  }
   for (const state of ['empty','error','loading','unavailable']) {
     mode = state;
     await send('Page.navigate', { url: 'http://127.0.0.1:5179/' });

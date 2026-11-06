@@ -184,3 +184,99 @@ Application lifecycle guarantees do not cover direct SQL mutations. Proof files
 and database rows are not one atomic resource: compensating cleanup is best effort
 and a process/filesystem failure may leave an orphan file. No frontend editing or
 proof UI is implemented by this backend change.
+
+
+## Personal de desarrollo para smoke tests
+
+No hay registro publico. El comando explicito `python -m bladys.seed_staff`
+crea solo `reception_test` (RECEPTION) y `kitchen_test` (KITCHEN), activos,
+con `User` y el hash Argon2 existentes. Nunca se ejecuta al arrancar FastAPI.
+No crea tablas ni aplica migraciones. Repetirlo conserva IDs, hashes, roles y
+actividad de cuentas existentes; una cuenta con rol distinto o inactiva provoca
+error y rollback de toda la siembra. No sirve para restablecer contrasenas.
+
+Configuracion obligatoria para el comando:
+
+- `DATABASE_URL`: la misma configuracion que usa el backend, PostgreSQL local.
+- `APP_ENV=development`.
+- `BLADYS_ALLOW_DEV_STAFF_SEED=1`: habilitacion explicita de esta operacion.
+- `DEV_RECEPTION_PASSWORD`: contrasena elegida para `reception_test`.
+- `DEV_KITCHEN_PASSWORD`: contrasena elegida para `kitchen_test`.
+
+El destino debe usar `localhost`, `127.0.0.1` o `::1`. Se permite el nombre exacto
+`bladys` para la base local de desarrollo, o un nombre con segmento `dev` o `test`
+separado por `_`, como `bladys_dev` o `bladys_test`. `APP_ENV=development` y la
+habilitacion explicita siguen siendo obligatorios, incluso para `bladys`.
+Usa `bladys` para el smoke test y reserva `bladys_test` para pruebas automatizadas:
+sus fixtures limpian tablas y pueden borrar las cuentas. Apunta FastAPI y el
+comando a la misma base local. No uses datos reales.
+Solo se admite el parametro URL opcional `options=-csearch_path=<esquema>`;
+parametros que puedan redirigir la conexion se rechazan. Retira tambien
+`PGHOST`, `PGHOSTADDR`, `PGSERVICE` y `PGSERVICEFILE` del entorno si estan definidos.
+Estas barreras previenen errores comunes; no certifican que una base con nombre
+de desarrollo carezca de datos productivos ni detectan tuneles locales hacia produccion.
+
+Desde la raiz del repositorio, con `DATABASE_URL` ya configurada en el entorno
+o en `.env` local (ignorado por Git) y apuntando a esa base de desarrollo:
+Puedes abrir una terminal PowerShell nueva para mantener los servidores activos.
+Las variables `$env:` de otra terminal no se transfieren a ella: vuelve a
+configurarlas alli, o conserva `DATABASE_URL` en `.env`. Ejecuta todos los pasos
+del bloque siguiente en la misma terminal. Las claves se escriben cuando
+Read-Host las solicite; el texto entre comillas es solo la etiqueta del mensaje.
+
+```powershell
+# Aplicar las migraciones existentes sobre la base de desarrollo preparada.
+uv run alembic upgrade head
+if ($LASTEXITCODE -ne 0) { throw 'No se pudieron aplicar las migraciones.' }
+$env:APP_ENV = 'development'
+$env:BLADYS_ALLOW_DEV_STAFF_SEED = '1'
+try {
+    $env:DEV_RECEPTION_PASSWORD = [System.Net.NetworkCredential]::new('', (Read-Host 'Clave para reception_test' -AsSecureString)).Password
+    $env:DEV_KITCHEN_PASSWORD = [System.Net.NetworkCredential]::new('', (Read-Host 'Clave para kitchen_test' -AsSecureString)).Password
+    uv run python -m bladys.seed_staff
+    if ($LASTEXITCODE -ne 0) { throw 'La siembra no se completo.' }
+} finally {
+    Remove-Item Env:DEV_RECEPTION_PASSWORD -ErrorAction SilentlyContinue
+    Remove-Item Env:DEV_KITCHEN_PASSWORD -ErrorAction SilentlyContinue
+    Remove-Item Env:BLADYS_ALLOW_DEV_STAFF_SEED -ErrorAction SilentlyContinue
+}
+```
+
+Elegir claves propias diferentes, sin escribirlas literalmente en comandos ni en
+archivos versionados. Read-Host oculta la entrada y evita que la clave se escriba
+en el historial de comandos. Las variables de entorno contienen texto plano
+mientras corre el proceso; no son una boveda de secretos. El script no imprime
+contrasenas, hashes ni tokens. Para automatizacion se pueden cargar las mismas
+variables desde configuracion local no versionada; `.env` y `.env.*` ya se ignoran.
+
+Para el smoke test, configura tambien `JWT_SECRET_KEY` con el secreto existente
+del backend (el seed no emite JWT ni necesita este secreto). Inicia FastAPI y el
+proxy del frontend segun `frontend/README.md`, usando la misma `DATABASE_URL`.
+Abre `http://127.0.0.1:5173/#reception`, ingresa `reception_test` y la clave elegida:
+la cola real debe cargar. Un acceso con `kitchen_test` debe mostrar falta de permiso.
+La pantalla de Cocina sigue siendo una vista previa; su API se puede comprobar
+sin imprimir el JWT mediante este ejemplo opcional:
+
+```powershell
+$smokeCredential = Get-Credential -UserName 'kitchen_test' -Message 'Clave de desarrollo'
+try {
+    $smokeBody = @{ username = $smokeCredential.UserName; password = $smokeCredential.GetNetworkCredential().Password } | ConvertTo-Json
+    $smokeLogin = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/login' -ContentType 'application/json' -Body $smokeBody
+    $smokeOrders = Invoke-RestMethod -Uri 'http://127.0.0.1:8000/kitchen/orders/pending' -Headers @{ Authorization = "Bearer $($smokeLogin.access_token)" }
+    Write-Host 'Login de Cocina y consulta autorizada completados.'
+} finally {
+    Remove-Variable smokeCredential, smokeBody, smokeLogin, smokeOrders -ErrorAction SilentlyContinue
+}
+```
+
+`POST /login` sigue aceptando JSON `{username,password}` y responde
+`{access_token,token_type:"bearer"}`; claves incorrectas reciben 401. Las rutas
+staff siguen comprobando el rol actual en la base. No se cambiaron autenticacion
+de invitados, reglas de pagos ni frontend.
+
+Validacion focalizada con PostgreSQL en un esquema desechable (requiere
+`TEST_DATABASE_URL`, no modifica las tablas habituales):
+
+```powershell
+uv run python tests/run_order_modification_audit.py tests/test_seed_staff.py tests/test_login.py tests/test_authentication.py tests/test_staff_authorization.py tests/test_current_user.py
+```

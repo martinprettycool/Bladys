@@ -1,12 +1,11 @@
 import { element as el, button, state, badge } from './components.js';
 import { cents, money, identity } from './cart.js';
-import { getOrder } from './api.js';
 
 export function summaryRows(items, labels = items, confirmed = false) {
   const list = el('div', { className: 'checkout-items' });
   for (const item of items) {
     const id = item.variant_id ?? item.variant.id;
-    const label = labels.find(i => identity(i.variant.id, i.selected_flavors) === identity(id, item.selected_flavors));
+    const label = labels.find(i => identity(i.variant.id, i.selected_flavors) === identity(id, item.selected_flavors)) || labels.find(i => i.variant.id === id);
     const price = confirmed ? cents(item.unit_price) : cents(item.variant.price);
     const copy = el('div', { className: 'checkout-item-copy' }, [
       el('h3', { text: label?.product.name || `Variante ${id}` }),
@@ -46,42 +45,4 @@ export function checkoutScreen({ cart, checkout, onEdit, onSuccess }) {
     if (checkout.error) node.querySelector('[role=alert]')?.focus({ preventScroll: true });
   });
   return { node, cleanup: unsubscribe };
-}
-export function orderScreen({ checkout }) {
-  const node = el('section', { className: 'customer-shell checkout-shell', 'aria-labelledby': 'order-title' });
-  let active = true, loading = false, message = '';
-  async function refresh() {
-    if (!checkout.receipt || loading) return;
-    loading = true; message = ''; render();
-    const receipt = checkout.receipt;
-    try { const order = await getOrder(receipt.order.id, receipt.token); if (active) checkout.updateOrder(order); }
-    catch (error) { if (active) message = error.message + ' Se muestra la \u00faltima confirmaci\u00f3n recibida.'; }
-    finally { loading = false; if (active) render(); }
-  }
-  function render() {
-    node.replaceChildren(el('h1', { id: 'order-title', text: 'Mi pedido' }));
-    const receipt = checkout.receipt;
-    if (!receipt) {
-      node.append(state({ title: 'No hay un pedido en esta pesta\u00f1a', description: 'Confirma tu carrito para recibir un n\u00famero de pedido.', action: el('a', { className: 'button button-primary', href: '#menu', text: 'Ver men\u00fa' }) })); return;
-    }
-    const order = receipt.order;
-    node.append(el('h2', { className: 'order-number', text: `Pedido #${order.id}` }),
-      badge(order.status.replaceAll('_', ' ')),
-      summaryRows(order.items, receipt.items, true),
-      el('div', { className: 'cart-total' }, [el('strong', { text: 'Total confirmado' }), el('strong', { className: 'confirmed-total', text: money(cents(order.total)) })]),
-      el('section', { className: 'checkout-payment notice', 'aria-labelledby': 'payment-title' }, [
-        el('h2', { id: 'payment-title', text: 'Siguiente paso: transferencia bancaria' }),
-        el('p', { text: 'Las instrucciones de transferencia del restaurante est\u00e1n pendientes de configuraci\u00f3n. Contacta al restaurante para recibir los datos verificados antes de transferir.' }),
-        el('p', { className: 'muted', text: 'Esta pantalla no confirma un pago ni su aprobaci\u00f3n. El env\u00edo del comprobante se habilitar\u00e1 en la siguiente etapa.' }),
-      ]));
-    if (checkout.storageWarning) node.append(el('p', { role: 'alert', className: 'checkout-error', text: 'El pedido ya fue creado, pero no pudimos guardar su acceso. Conservamos el carrito y las credenciales en esta pesta\u00f1a. Mant\u00e9nla abierta y pulsa Guardar acceso al pedido; no se enviar\u00e1 otro pedido.' }));
-    if (checkout.confirmedRecovery) node.append(button('Guardar acceso al pedido', { variant: 'secondary', onClick: async () => { await checkout.submit(); if (active) render(); } }));
-    if (message) node.append(el('p', { role: 'alert', className: 'checkout-error', text: message }));
-    node.append(el('div', { className: 'checkout-actions' }, [
-      button(loading ? 'Consultando\u2026' : 'Actualizar estado', { variant: 'secondary', disabled: loading, onClick: refresh }),
-      el('a', { href: '#menu', className: 'button button-quiet', text: 'Volver al men\u00fa' }),
-    ]));
-  }
-  render(); refresh();
-  return { node, cleanup: () => { active = false; } };
 }

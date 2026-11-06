@@ -1,7 +1,10 @@
+import { kitchenScreen } from './kitchen.js';
+import { receptionScreen } from './reception.js';
 import { element as el, button, badge, input, card, state, brand } from './components.js';
 import { customerMenu, showCart, subscribeCart, cart, checkout } from './menu.js';
 
-import { checkoutScreen, orderScreen } from './checkout.js';
+import { checkoutScreen } from './checkout.js';
+import { ordersScreen } from './orders.js';
 
 document.querySelector('[data-brand]').replaceWith(brand());
 
@@ -59,9 +62,8 @@ function foundation() {
 }
 
 const headerCart = button('Carrito', { variant: 'secondary', onClick: () => showCart(dialog) });
-const myOrder = el('a', { href: '#my-order', text: 'Mi pedido', hidden: '' });
+const myOrder = el('a', { href: '#orders', text: 'Mis pedidos' });
 document.querySelector('.site-header nav').replaceChildren(myOrder, headerCart);
-checkout.subscribe(() => { myOrder.hidden = !checkout.receipt; });
 subscribeCart(() => {
   headerCart.textContent = cart.count ? `Carrito (${cart.count})` : 'Carrito';
   headerCart.classList.toggle('has-items', cart.count > 0);
@@ -78,10 +80,14 @@ function route() {
   }
   routeCleanup();
   if (dialog.open) dialog.close();
-  const current = ['reception', 'kitchen', 'foundation', 'checkout', 'my-order'].includes(requested) ? requested : 'menu';
+  const current = ['reception', 'kitchen', 'foundation', 'checkout', 'my-order', 'orders'].includes(requested) ? requested : 'menu';
   document.body.dataset.surface = current;
-  if (current === 'checkout' || current === 'my-order') {
-    const view = current === 'checkout' ? checkoutScreen({ cart, checkout, onEdit: () => showCart(dialog), onSuccess: () => { location.hash = 'my-order'; } }) : orderScreen({ checkout });
+  if (current === 'checkout' || current === 'my-order' || current === 'orders') {
+    const view = current === 'checkout' ? checkoutScreen({ cart, checkout, onEdit: () => showCart(dialog), onSuccess: () => { location.hash = 'my-order'; } }) : ordersScreen({ checkout, dialog, latest: current === 'my-order' });
+    main.replaceChildren(view.node);
+    routeCleanup = view.cleanup;
+  } else if (current === 'reception' || current === 'kitchen') {
+    const view = current === 'kitchen' ? kitchenScreen() : receptionScreen();
     main.replaceChildren(view.node);
     routeCleanup = view.cleanup;
   } else if (current === 'menu') {
@@ -92,8 +98,8 @@ function route() {
     main.replaceChildren(current === 'foundation' ? foundation() : staff(current));
     routeCleanup = () => {};
   }
-  document.title = "Blady's Pizza · " + ({ menu: 'Menú', reception: 'Recepción', kitchen: 'Cocina', foundation: 'Guía visual', checkout: 'Confirmar carrito', 'my-order': 'Mi pedido' }[current]);
-  if (current === 'checkout' || current === 'my-order') window.scrollTo(0, 0);
+  document.title = "Blady's Pizza · " + ({ menu: 'Menú', reception: 'Recepción', kitchen: 'Cocina', foundation: 'Guía visual', checkout: 'Confirmar carrito', 'my-order': 'Mi pedido', orders: 'Mis pedidos' }[current]);
+  if (current === 'checkout' || current === 'my-order' || current === 'orders') window.scrollTo(0, 0);
   if (requested && !customerAnchor) main.focus({ preventScroll: true });
 }
 window.addEventListener('hashchange', route);

@@ -16,26 +16,38 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
-        if path == "/products" or re.fullmatch(r"/orders/[1-9][0-9]*", path):
+        if path in {"/products", "/payments/pending", "/kitchen/orders", "/kitchen/orders/pending"} or re.fullmatch(r"/(?:reception/orders/[1-9][0-9]*|payments/[1-9][0-9]*/proof)", path) or re.fullmatch(r"/orders/[1-9][0-9]*(?:/payment)?", path):
             return self.proxy(path)
         return super().do_GET()
 
     def do_POST(self):
-        if self.path != "/orders":
+        if self.path not in {"/orders", "/login"} and not re.fullmatch(r"/orders/[1-9][0-9]*/payment/proof", self.path):
             return self.send_error(404)
-        return self.proxy("/orders")
+        return self.proxy(self.path)
+
+    def do_PUT(self):
+        if not re.fullmatch(r"/orders/[1-9][0-9]*/items", self.path):
+            return self.send_error(404)
+        return self.proxy(self.path)
+
+    def do_PATCH(self):
+        if not re.fullmatch(r"/(?:payments|kitchen/orders)/[1-9][0-9]*/status", self.path):
+            return self.send_error(404)
+        return self.proxy(self.path)
 
     def proxy(self, path):
         headers = {name: self.headers[name] for name in
-                   ("Content-Type", "Accept", "Idempotency-Key", "X-Order-Access-Token")
+                   ("Content-Type", "Accept", "Authorization", "Idempotency-Key", "X-Order-Access-Token")
                    if name in self.headers}
         data = None
-        if self.command == "POST":
+        if self.command in {"POST", "PUT", "PATCH"}:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 return self.send_error(400)
-            if not 0 < length <= 1024 * 1024:
+            # Multipart includes the file plus browser-generated boundaries and fields.
+            max_length = 5 * 1024 * 1024 + 64 * 1024 if self.path.endswith("/payment/proof") else 1024 * 1024
+            if not 0 < length <= max_length:
                 return self.send_error(413)
             data = self.rfile.read(length)
         request = Request(self.backend + path, data=data, headers=headers, method=self.command)
