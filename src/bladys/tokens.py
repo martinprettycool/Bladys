@@ -13,6 +13,7 @@ def create_access_token(user_id: int) -> str:
     issued_at = datetime.now(timezone.utc)
     claims = {
         "sub": str(user_id),
+        "purpose": "staff_access",
         "iat": issued_at,
         "exp": issued_at + timedelta(minutes=settings.access_token_expire_minutes),
     }
@@ -24,8 +25,10 @@ def decode_access_token(token: str) -> int:
     settings = get_jwt_settings()
     claims = jwt.decode(
         token, settings.secret_key, algorithms=[JWT_ALGORITHM],
-        options={"require": ["sub", "exp"]},
+        options={"require": ["sub", "exp", "purpose"]},
     )
+    if claims["purpose"] != "staff_access":
+        raise jwt.InvalidTokenError("Invalid token purpose")
     subject = claims["sub"]
     # User.id is a PostgreSQL INTEGER; reject invalid IDs before querying it.
     if not isinstance(subject, str) or not subject.isascii() or not subject.isdecimal():

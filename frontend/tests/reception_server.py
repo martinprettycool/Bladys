@@ -1,5 +1,6 @@
 """Real API with disposable SQLite data and test-only staff credentials."""
 import os
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ['DATABASE_URL'] = 'sqlite://'
 os.environ['JWT_SECRET_KEY'] = 'reception-browser-test-only-secret-123456789'
 os.environ['ORDER_ACCESS_SECRET_KEY'] = 'reception-browser-order-only-secret-123456789'

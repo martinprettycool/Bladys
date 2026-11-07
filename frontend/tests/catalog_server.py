@@ -1,6 +1,8 @@
 """Browser-test server: actual FastAPI catalog on an isolated in-memory database."""
 import os
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["DATABASE_URL"] = "sqlite://"
+os.environ["JWT_SECRET_KEY"] = "browser-test-only-staff-signing-secret-123456789"
 os.environ["ORDER_ACCESS_SECRET_KEY"] = "browser-test-only-order-capability-secret"
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session

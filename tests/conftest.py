@@ -1,7 +1,14 @@
 import os
 
+# Disable dotenv BEFORE application imports: tests must never read real .env files.
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+
 # Force SQLite before application imports, even when an external URL is set.
 os.environ["DATABASE_URL"] = "sqlite://"
+os.environ["JWT_SECRET_KEY"] = "test-only-jwt-secret-not-for-production-123456789"
+os.environ["ORDER_ACCESS_SECRET_KEY"] = "test-only-order-capability-secret-123456789"
+os.environ["ACCESS_TOKEN_EXPIRE_MINUTES"] = "30"
+os.environ["ORDER_ACCESS_TOKEN_EXPIRE_MINUTES"] = "1440"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -190,5 +197,13 @@ def postgres_staff_headers(postgres_session, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def order_access_environment(monkeypatch):
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-only-jwt-secret-not-for-production-123456789")
+    monkeypatch.delenv("ACCESS_TOKEN_EXPIRE_MINUTES", raising=False)
     monkeypatch.setenv("ORDER_ACCESS_SECRET_KEY", "test-only-order-capability-secret-123456789")
     monkeypatch.delenv("ORDER_ACCESS_TOKEN_EXPIRE_MINUTES", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolated_payment_proof_storage(tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("PAYMENT_PROOFS_DIR", str(tmp_path / "media" / "payment_proofs"))

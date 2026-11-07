@@ -1,5 +1,9 @@
 from pathlib import Path
+import os
+import tempfile
 import uuid
+
+from bladys.config import get_payment_proofs_dir
 
 from fastapi import HTTPException, UploadFile, status
 
@@ -39,27 +43,56 @@ def save_payment_proof(image_bytes: bytes, content_type: str) -> str:
     except KeyError:
         raise ValueError("Payment proof content type must be image/jpeg or image/png.") from None
 
-    destination = Path("media") / "payment_proofs" / f"{uuid.uuid4()}{extension}"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(image_bytes)
-    return destination.as_posix()
+    storage = get_payment_proofs_dir()
+    if os.environ.get("APP_ENV", "development").lower() != "production":
+        storage.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = storage / f"{uuid.uuid4()}{extension}"
+    # Exclusive creation refuses existing files and symlinks; private on POSIX.
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(image_bytes)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    return f"media/payment_proofs/{destination.name}"
+
+
+def validate_payment_proofs_storage() -> None:
+    """Fail startup if storage cannot actually create, write and remove a file."""
+    storage = get_payment_proofs_dir()
+    try:
+        if os.environ.get("APP_ENV", "development").lower() != "production":
+            storage.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryFile(dir=storage) as probe:
+            probe.write(b"storage probe")
+            probe.flush()
+    except OSError as exc:
+        raise RuntimeError("PAYMENT_PROOFS_DIR must be an existing writable directory") from exc
+
+
+def _proof_path(proof_reference: str, *, strict: bool) -> Path:
+    # Database references are logical legacy keys, never physical server paths.
+    parts = proof_reference.split("/")
+    if (len(parts) != 3 or parts[:2] != ["media", "payment_proofs"]
+            or parts[2] in {"", ".", ".."} or "\\" in proof_reference
+            or ":" in parts[2]):
+        raise ValueError("Payment proof reference is outside the storage directory.")
+    storage = get_payment_proofs_dir()
+    candidate = (storage / parts[2]).resolve(strict=strict)
+    if candidate.parent != storage or candidate.suffix not in {".jpg", ".png"}:
+        raise ValueError("Payment proof reference is outside the storage directory.")
+    return candidate
 
 
 def delete_payment_proof(proof_reference: str) -> None:
-    """Delete a stored proof, refusing references outside the proof directory."""
-    storage = (Path("media") / "payment_proofs").resolve()
-    candidate = Path(proof_reference).resolve()
-    if candidate.parent != storage:
-        raise ValueError("Payment proof reference is outside the storage directory.")
-    candidate.unlink(missing_ok=True)
+    """Delete only a proof inside configured storage; tolerate missing files."""
+    _proof_path(proof_reference, strict=False).unlink(missing_ok=True)
 
 
 def resolve_payment_proof(proof_reference: str) -> Path:
-    """Resolve an existing image only within the local proof storage area."""
-    storage = (Path("media") / "payment_proofs").resolve()
-    candidate = Path(proof_reference).resolve(strict=True)
-    if candidate.parent != storage or candidate.suffix not in {".jpg", ".png"}:
-        raise ValueError("Invalid payment proof reference.")
+    """Resolve a legacy reference against the configured private directory."""
+    candidate = _proof_path(proof_reference, strict=True)
     if not candidate.is_file():
         raise ValueError("Payment proof reference is not a file.")
     return candidate

@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Annotated
 
@@ -9,8 +10,9 @@ from sqlalchemy.exc import IntegrityError
 
 from bladys.payment_proofs import (
     read_and_validate_payment_proof, save_payment_proof, delete_payment_proof,
-    resolve_payment_proof,
+    resolve_payment_proof, validate_payment_proofs_storage,
 )
+from bladys.config import validate_signing_secrets
 from bladys.authentication import authenticate_user
 from bladys.tokens import create_access_token
 from bladys.order_tokens import create_order_access_token
@@ -26,7 +28,15 @@ from bladys.order_lifecycle import EXPECTED_STATUS, OrderStatus
 from bladys.idempotency import build_request_hash
 from bladys.menu import ProductCategory, WING_FLAVORS
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    validate_signing_secrets()
+    validate_payment_proofs_storage()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/login", response_model=TokenResponse)

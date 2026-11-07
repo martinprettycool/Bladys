@@ -280,3 +280,26 @@ Validacion focalizada con PostgreSQL en un esquema desechable (requiere
 ```powershell
 uv run python tests/run_order_modification_audit.py tests/test_seed_staff.py tests/test_login.py tests/test_authentication.py tests/test_staff_authorization.py tests/test_current_user.py
 ```
+
+
+## Aislamiento de tokens y validacion de arranque
+
+Los JWT de personal requieren `purpose=staff_access`; los de pedidos requieren
+`purpose=order_access`. Ningun tipo sirve para autenticar al otro, aunque coincidan
+los IDs. Se conservan la verificacion del rol/actividad y la propiedad del pedido.
+Los tokens staff anteriores sin `purpose` dejan de ser validos: volver a iniciar
+sesion. Los tokens guest existentes conservan validez hasta expirar si no cambia
+su clave. Desplegar todos los procesos con la misma version para evitar rechazos
+intermitentes durante la actualizacion.
+
+El arranque exige `JWT_SECRET_KEY` y `ORDER_ACCESS_SECRET_KEY` diferentes, cada una
+con al menos 32 bytes UTF-8, ocho caracteres distintos y sin espacios exteriores.
+Estos controles detectan debilidades evidentes; no certifican entropia. Generar
+ambas claves independientemente con un generador criptografico y mantenerlas
+fuera del repositorio. Tambien se validan las vigencias positivas existentes.
+El servidor debe ejecutar el lifespan ASGI; no deshabilitarlo.
+
+Las pruebas pytest y los servidores de navegador deshabilitan la carga de `.env`
+y utilizan claves ficticias. Para pruebas PostgreSQL, proporcionar explicitamente
+`TEST_DATABASE_URL` hacia una base desechable antes de ejecutarlas; las fixtures
+limpian tablas. La configuracion local `.env` no se carga desde `conftest.py`.

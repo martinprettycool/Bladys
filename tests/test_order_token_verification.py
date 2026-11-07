@@ -99,7 +99,7 @@ def test_staff_jwt_is_rejected(monkeypatch):
         decode_order_access_token(create_access_token(42))
 
 
-def test_staff_jwt_without_order_purpose_is_rejected_even_if_secrets_match(monkeypatch):
+def test_staff_jwt_with_staff_purpose_is_rejected_even_if_secrets_match(monkeypatch):
     monkeypatch.setenv("JWT_SECRET_KEY", get_order_access_settings().secret_key)
-    with pytest.raises(jwt.MissingRequiredClaimError):
+    with pytest.raises(jwt.InvalidTokenError, match="Invalid token purpose"):
         decode_order_access_token(create_access_token(42))

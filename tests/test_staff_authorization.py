@@ -43,7 +43,8 @@ def test_staff_operations_authorization(
     elif identity == "expired":
         user = session.scalar(select(User).where(User.role == role))
         token = jwt.encode({
-            "sub": str(user.id), "exp": datetime.now(timezone.utc) - timedelta(minutes=1),
+            "sub": str(user.id), "purpose": "staff_access",
+            "exp": datetime.now(timezone.utc) - timedelta(minutes=1),
         }, get_jwt_settings().secret_key, algorithm=JWT_ALGORITHM)
         headers = {"Authorization": f"Bearer {token}"}
     elif identity == "inactive":

@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException, UploadFile
 from starlette.datastructures import Headers
 
-from bladys.payment_proofs import read_and_validate_payment_proof
+from bladys.payment_proofs import read_and_validate_payment_proof, resolve_payment_proof
 
 
 @pytest.mark.parametrize("content_type", ["image/jpeg", "image/png"])
@@ -108,8 +108,8 @@ def test_save_payment_proof_generates_unique_filenames(tmp_path, monkeypatch):
     second = save_payment_proof(b"second proof", "image/jpeg")
 
     assert first != second
-    assert Path(first).read_bytes() == b"first proof"
-    assert Path(second).read_bytes() == b"second proof"
+    assert resolve_payment_proof(first).read_bytes() == b"first proof"
+    assert resolve_payment_proof(second).read_bytes() == b"second proof"
 
 
 def test_save_payment_proof_rejects_unsupported_type_without_writing(tmp_path, monkeypatch):
@@ -138,3 +138,102 @@ def test_delete_payment_proof_is_safe_and_tolerates_missing_file(tmp_path, monke
     with pytest.raises(ValueError, match="outside"):
         delete_payment_proof("media/payment_proofs/../../outside.jpg")
     assert outside.read_bytes() == b"keep"
+
+
+
+def test_default_storage_is_independent_of_cwd(tmp_path, monkeypatch):
+    from bladys.config import PROJECT_ROOT, get_payment_proofs_dir
+    monkeypatch.delenv("PAYMENT_PROOFS_DIR")
+    monkeypatch.chdir(tmp_path)
+    assert get_payment_proofs_dir() == (PROJECT_ROOT / "media/payment_proofs").resolve()
+    monkeypatch.setenv("PAYMENT_PROOFS_DIR", "custom/proofs")
+    assert get_payment_proofs_dir() == (PROJECT_ROOT / "custom/proofs").resolve()
+
+
+def test_configured_storage_preserves_legacy_reference_across_cwd(tmp_path, monkeypatch):
+    from bladys.payment_proofs import save_payment_proof, delete_payment_proof
+    storage = tmp_path / "persistent"
+    storage.mkdir()
+    old = storage / "existing.jpg"
+    old.write_bytes(b"old proof")
+    monkeypatch.setenv("PAYMENT_PROOFS_DIR", str(storage))
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.chdir(tmp_path)
+    assert resolve_payment_proof("media/payment_proofs/existing.jpg") == old
+    reference = save_payment_proof(b"new proof", "image/png")
+    assert reference.startswith("media/payment_proofs/")
+    monkeypatch.chdir(tmp_path.parent)
+    assert resolve_payment_proof(reference).read_bytes() == b"new proof"
+    delete_payment_proof(reference)
+    assert list(storage.iterdir()) == [old]
+
+
+@pytest.mark.parametrize("configured", [None, "", "relative/proofs"])
+def test_production_requires_explicit_absolute_storage(monkeypatch, configured):
+    from bladys.payment_proofs import validate_payment_proofs_storage
+    monkeypatch.setenv("APP_ENV", "production")
+    if configured is None:
+        monkeypatch.delenv("PAYMENT_PROOFS_DIR")
+    else:
+        monkeypatch.setenv("PAYMENT_PROOFS_DIR", configured)
+    with pytest.raises(RuntimeError, match="PAYMENT_PROOFS_DIR"):
+        validate_payment_proofs_storage()
+
+
+@pytest.mark.parametrize("kind", ["missing", "file", "unwritable"])
+def test_startup_rejects_unusable_production_storage(tmp_path, monkeypatch, kind):
+    from bladys import payment_proofs
+    storage = tmp_path / "configured"
+    if kind == "file":
+        storage.write_bytes(b"keep")
+    elif kind == "unwritable":
+        storage.mkdir()
+        def deny(*args, **kwargs):
+            raise PermissionError("denied")
+        monkeypatch.setattr(payment_proofs.tempfile, "TemporaryFile", deny)
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("PAYMENT_PROOFS_DIR", str(storage))
+    with pytest.raises(RuntimeError, match="existing writable directory"):
+        payment_proofs.validate_payment_proofs_storage()
+    if kind == "missing":
+        assert not storage.exists()
+
+
+@pytest.mark.parametrize("reference", [
+    "media/payment_proofs/../secret.jpg", "media/payment_proofs/./proof.jpg",
+    "media/payment_proofs/../../proof.jpg", "/server/proof.jpg",
+    "media/payment_proofs/..\\secret.jpg",
+])
+def test_invalid_reference_rejected_for_read_and_delete(reference):
+    from bladys.payment_proofs import delete_payment_proof
+    for operation in (resolve_payment_proof, delete_payment_proof):
+        with pytest.raises(ValueError):
+            operation(reference)
+
+
+def test_symlink_escape_rejected_for_read_and_delete(tmp_path, monkeypatch):
+    from bladys.payment_proofs import delete_payment_proof
+    storage = tmp_path / "proofs"
+    storage.mkdir()
+    outside = tmp_path / "secret.jpg"
+    outside.write_bytes(b"keep")
+    try:
+        (storage / "link.jpg").symlink_to(outside)
+    except OSError:
+        pytest.skip("Creating symlinks requires OS permission")
+    monkeypatch.setenv("PAYMENT_PROOFS_DIR", str(storage))
+    for operation in (resolve_payment_proof, delete_payment_proof):
+        with pytest.raises(ValueError):
+            operation("media/payment_proofs/link.jpg")
+    assert outside.read_bytes() == b"keep"
+
+
+
+def test_application_startup_rejects_missing_production_directory(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from bladys.main import app
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("PAYMENT_PROOFS_DIR", str(tmp_path / "missing"))
+    with pytest.raises(RuntimeError, match="PAYMENT_PROOFS_DIR"):
+        with TestClient(app):
+            pytest.fail("Startup must reject missing production storage")

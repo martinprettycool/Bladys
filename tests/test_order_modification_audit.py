@@ -265,7 +265,7 @@ def test_proof_requires_positive_version(postgres_client, audit_order, tmp_path,
     response = postgres_client.post(f"/orders/{audit_order[0]}/payment/proof", headers=audit_order[2],
         data=data, files={"file": ("proof.jpg", b"proof", "image/jpeg")})
     assert response.status_code == 422
-    assert not (tmp_path / "media").exists()
+    assert not list((tmp_path / "media" / "payment_proofs").glob("*"))
 
 
 def test_stale_proof_cleans_file_and_preserves_payment(postgres_client, postgres_engine, audit_order, tmp_path, monkeypatch):

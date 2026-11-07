@@ -5,6 +5,7 @@ from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from bladys.payment_proofs import resolve_payment_proof
 from bladys.order_tokens import create_order_access_token
 from bladys.models import Order, Payment, UserRole
 from test_orders import seeded_order_client
@@ -60,7 +61,7 @@ def test_proof_and_reception(client, payment_order, engine, decision, staff_head
     proof = submit(client, order_id)
     assert proof.status_code == 200
     assert proof.json()["status"] == "PENDIENTE_VERIFICACION"
-    assert Path(proof.json()["proof_reference"]).read_bytes() == b"receipt bytes"
+    assert resolve_payment_proof(proof.json()["proof_reference"]).read_bytes() == b"receipt bytes"
     assert [p["id"] for p in client.get("/payments/pending", headers=staff_headers[UserRole.RECEPTION]).json()] == [payment_id]
     assert decide(client, payment_id, decision, staff_headers).status_code == 200
     assert client.get("/payments/pending", headers=staff_headers[UserRole.RECEPTION]).json() == []
@@ -184,7 +185,7 @@ def test_owned_proof_submission_persists_reference_and_transition(client, paymen
     order_id, payment_id = payment_order
     response = submit(client, order_id)
     assert response.status_code == 200
-    assert Path(response.json()["proof_reference"]).read_bytes() == b"receipt bytes"
+    assert resolve_payment_proof(response.json()["proof_reference"]).read_bytes() == b"receipt bytes"
     assert response.json()["status"] == "PENDIENTE_VERIFICACION"
     with Session(engine) as verification:
         payment = verification.get(Payment, payment_id)
@@ -234,7 +235,7 @@ def test_real_upload(client, payment_order, engine, mime, extension):
     assert response.status_code == 200
     reference = response.json()["proof_reference"]
     assert Path(reference).suffix == extension
-    assert Path(reference).read_bytes() == content
+    assert resolve_payment_proof(reference).read_bytes() == content
     with Session(engine) as db:
         payment = db.get(Payment, payment_id)
         assert payment.status == "PENDIENTE_VERIFICACION"
@@ -255,7 +256,7 @@ def test_invalid_upload_preserves_payment(client, payment_order, engine, proof_s
         files={"file": ("proof", content, mime)},
     )
     assert response.status_code == expected
-    assert not proof_storage.exists()
+    assert not list(proof_storage.glob("*"))
     with Session(engine) as db:
         payment = db.get(Payment, payment_id)
         assert payment.status == "PENDIENTE_COMPROBANTE"
@@ -268,7 +269,7 @@ def test_staff_jwt_cannot_submit_proof(client, payment_order, staff_headers, pro
     headers = {"Authorization": jwt_header} if location == "bearer" else {
         "X-Order-Access-Token": jwt_header.removeprefix("Bearer ")}
     assert submit(client, payment_order[0], headers).status_code == 401
-    assert not proof_storage.exists()
+    assert not list(proof_storage.glob("*"))
 
 
 @pytest.mark.parametrize("failure", ["update", "commit"])
@@ -278,7 +279,7 @@ def test_failed_database_operation_cleans_new_file(client, payment_order, engine
     Escenarios: falla el UPDATE o el commit; un comprobante anterior se conserva.
     """
     order_id, payment_id = payment_order
-    proof_storage.mkdir(parents=True)
+    proof_storage.mkdir(parents=True, exist_ok=True)
     previous = proof_storage / "previous.jpg"
     previous.write_bytes(b"previous")
 
@@ -315,8 +316,8 @@ def test_conflict_cleans_new_file_and_preserves_existing(client, payment_order, 
     assert first.status_code == 200
     reference = first.json()["proof_reference"]
     assert submit(client, payment_order[0]).status_code == 409
-    assert list(proof_storage.iterdir()) == [Path(reference).resolve()]
-    assert Path(reference).read_bytes() == b"receipt bytes"
+    assert list(proof_storage.iterdir()) == [resolve_payment_proof(reference)]
+    assert resolve_payment_proof(reference).read_bytes() == b"receipt bytes"
     with Session(engine) as db:
         assert db.get(Payment, payment_order[1]).proof_reference == reference
 
@@ -354,7 +355,7 @@ def test_proof_retrieval_not_found(client, payment_order, engine, staff_headers,
     if case == "missing-payment":
         payment_id += 1000
     elif case not in {"no-reference"}:
-        proof_storage.mkdir(parents=True)
+        proof_storage.mkdir(parents=True, exist_ok=True)
         target = proof_storage / "missing.jpg"
         if case == "directory":
             target.mkdir()
@@ -362,7 +363,7 @@ def test_proof_retrieval_not_found(client, payment_order, engine, staff_headers,
             target = proof_storage / "proof.txt"
             target.write_bytes(b"not an image")
         with Session(engine) as db:
-            db.get(Payment, payment_id).proof_reference = target.as_posix()
+            db.get(Payment, payment_id).proof_reference = "media/payment_proofs/" + target.name
             db.commit()
     response = client.get(f"/payments/{payment_id}/proof", headers=staff_headers[UserRole.RECEPTION])
     assert response.status_code == 404
@@ -390,15 +391,44 @@ def test_proof_reference_cannot_serve_outside_storage(client, payment_order, eng
 def test_proof_symlink_cannot_serve_outside_storage(client, payment_order, engine, staff_headers, proof_storage, tmp_path):
     outside = tmp_path / "secret.jpg"
     outside.write_bytes(b"private server data")
-    proof_storage.mkdir(parents=True)
+    proof_storage.mkdir(parents=True, exist_ok=True)
     link = proof_storage / "linked.jpg"
     try:
         link.symlink_to(outside)
     except OSError:
         pytest.skip("Creating symlinks requires OS permission")
     with Session(engine) as db:
-        db.get(Payment, payment_order[1]).proof_reference = link.as_posix()
+        db.get(Payment, payment_order[1]).proof_reference = "media/payment_proofs/" + link.name
         db.commit()
     response = client.get(f"/payments/{payment_order[1]}/proof", headers=staff_headers[UserRole.RECEPTION])
     assert response.status_code == 404
     assert b"private server data" not in response.content
+
+
+
+def test_production_storage_upload_and_legacy_retrieval_after_cwd_change(
+    client, payment_order, engine, staff_headers, tmp_path, monkeypatch,
+):
+    storage = tmp_path / "persistent-volume"
+    storage.mkdir()
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("PAYMENT_PROOFS_DIR", str(storage))
+    response = submit(client, payment_order[0])
+    assert response.status_code == 200
+    reference = response.json()["proof_reference"]
+    assert reference.startswith("media/payment_proofs/")
+    assert (storage / Path(reference).name).read_bytes() == b"receipt bytes"
+    monkeypatch.chdir(tmp_path.parent)
+    response = client.get(f"/payments/{payment_order[1]}/proof",
+                          headers=staff_headers[UserRole.RECEPTION])
+    assert response.status_code == 200
+    assert response.content == b"receipt bytes"
+    # An existing database key resolves using exactly the same storage mapping.
+    (storage / "legacy.jpg").write_bytes(b"legacy proof")
+    with Session(engine) as db:
+        db.get(Payment, payment_order[1]).proof_reference = "media/payment_proofs/legacy.jpg"
+        db.commit()
+    response = client.get(f"/payments/{payment_order[1]}/proof",
+                          headers=staff_headers[UserRole.RECEPTION])
+    assert response.status_code == 200
+    assert response.content == b"legacy proof"

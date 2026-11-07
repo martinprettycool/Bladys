@@ -48,7 +48,7 @@ def auth_client(engine):
 
 
 def signed_token(claims):
-    return jwt.encode(claims, get_jwt_settings().secret_key, algorithm=JWT_ALGORITHM)
+    return jwt.encode({"purpose": "staff_access", **claims}, get_jwt_settings().secret_key, algorithm=JWT_ALGORITHM)
 
 
 def test_valid_bearer_returns_expected_user(auth_client, current_user):

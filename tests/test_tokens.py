@@ -33,7 +33,8 @@ def test_token_can_be_created_for_user_id(token):
 
 def test_signed_subject_is_user_id_string(claims):
     assert claims["sub"] == "42"
-    assert set(claims) == {"sub", "iat", "exp"}
+    assert set(claims) == {"sub", "purpose", "iat", "exp"}
+    assert claims["purpose"] == "staff_access"
 
 
 def test_token_contains_expiration(claims):
