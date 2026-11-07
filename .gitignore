@@ -10,3 +10,4 @@ wheels/
 .env.*
 !.env.example
 .vscode/
+/media/payment_proofs/
