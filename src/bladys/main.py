@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Header, UploadFile, Form
 from fastapi.responses import FileResponse
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, update, text
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.exc import IntegrityError
 
@@ -27,6 +27,7 @@ from bladys.schemas import (
 from bladys.order_lifecycle import EXPECTED_STATUS, OrderStatus
 from bladys.idempotency import build_request_hash
 from bladys.menu import ProductCategory, WING_FLAVORS
+from bladys.database import engine
 
 
 @asynccontextmanager
@@ -37,6 +38,27 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+
+@app.get("/health/ready", include_in_schema=False)
+def health_ready():
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+    except SQLAlchemyError:
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable"
+        ) from None
+
+    return {"status": "ready"}
+
+
+@app.get("/health/live", include_in_schema=False)
+def health_live():
+    return {"status": "ok"}
 
 
 @app.post("/login", response_model=TokenResponse)

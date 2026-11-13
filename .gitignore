@@ -11,3 +11,5 @@ wheels/
 !.env.example
 .vscode/
 /media/payment_proofs/
+/secrets/
+/backups/

@@ -1,12 +1,8 @@
-﻿import os
-
-from dotenv import load_dotenv
-from sqlalchemy import create_engine
+﻿from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from bladys.config import read_secret
 
-load_dotenv()
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = read_secret("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL no está configurada")
 

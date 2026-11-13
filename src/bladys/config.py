@@ -11,6 +11,27 @@ from dotenv import load_dotenv
 load_dotenv()
 JWT_ALGORITHM = "HS256"
 
+def read_secret(name: str) -> str | None:
+    value = os.environ.get(name)
+    file_path = os.environ.get(f"{name}_FILE")
+
+    if value is not None and file_path is not None:
+        raise RuntimeError(
+            f"Configure {name} or {name}_FILE, not both"
+        )
+
+    if file_path is not None:
+        try:
+            return Path(file_path).read_text(
+                encoding="utf-8"
+            ).rstrip("\r\n")
+        except OSError:
+            raise RuntimeError(
+                f"Cannot read secret file for {name}"
+            ) from None
+
+    return value
+
 
 @dataclass(frozen=True)
 class JWTSettings:
@@ -20,7 +41,7 @@ class JWTSettings:
 
 def get_jwt_settings() -> JWTSettings:
     """Read JWT_SECRET_KEY and optional ACCESS_TOKEN_EXPIRE_MINUTES (default 30)."""
-    secret_key = os.environ.get("JWT_SECRET_KEY")
+    secret_key = read_secret("JWT_SECRET_KEY")
     if not secret_key or not secret_key.strip():
         raise RuntimeError("JWT_SECRET_KEY must be configured")
     try:
@@ -40,7 +61,7 @@ class OrderAccessSettings:
 
 def get_order_access_settings() -> OrderAccessSettings:
     """Read independent Order capability signing settings from the environment."""
-    secret_key = os.environ.get("ORDER_ACCESS_SECRET_KEY")
+    secret_key = read_secret("ORDER_ACCESS_SECRET_KEY")
     if not secret_key or not secret_key.strip():
         raise RuntimeError("ORDER_ACCESS_SECRET_KEY must be configured")
     try:

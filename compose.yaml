@@ -1,0 +1,106 @@
+
+name: bladys-docker-lab
+
+services:
+  db:
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: ${POSTGRES_DB:?required}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    secrets:
+      - postgres_password
+
+
+  api:
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    build: .
+    image: bladys-api:dev
+    environment:
+      APP_ENV: development
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_KEY_FILE: /run/secrets/jwt_secret_key
+      ORDER_ACCESS_SECRET_KEY_FILE: /run/secrets/order_access_secret_key
+      PAYMENT_PROOFS_DIR: /data/payment_proofs
+    secrets:
+      - database_url
+      - jwt_secret_key
+      - order_access_secret_key
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).close()"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      
+    volumes:
+      - media_data:/data/payment_proofs
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: bladys-web:dev
+    ports:
+      - "127.0.0.1:5174:80"
+    depends_on:
+      - api
+
+volumes:
+  db_data:
+  media_data:
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+
+  database_url:
+    file: ./secrets/database_url
+
+  jwt_secret_key:
+    file: ./secrets/jwt_secret_key
+
+  order_access_secret_key:
+    file: ./secrets/order_access_secret_key

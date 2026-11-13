@@ -1,0 +1,68 @@
+
+name: bladys-restore-lab
+
+services:
+  web:
+    image: bladys-web:dev
+    ports:
+      - "127.0.0.1:5175:80"
+    networks:
+      - restore_net
+    depends_on:
+      - api
+  api:
+    image: bladys-api:dev
+
+    user: "10001:10001"
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+
+    environment:
+      APP_ENV: development
+      DATABASE_URL_FILE: /run/secrets/database_url
+      JWT_SECRET_KEY_FILE: /run/secrets/jwt_secret_key
+      ORDER_ACCESS_SECRET_KEY_FILE: /run/secrets/order_access_secret_key
+      PAYMENT_PROOFS_DIR: /data/payment_proofs
+
+    volumes:
+      - restore_media:/data/payment_proofs
+
+    secrets:
+      - database_url
+      - jwt_secret_key
+      - order_access_secret_key
+
+    networks:
+      - restore_net
+
+volumes:
+  restore_media:
+    external: true
+    name: bladys-restore-mediadata
+
+networks:
+  restore_net:
+    external: true
+    name: bladys-restore-net
+
+secrets:
+  database_url:
+    file: ./secrets/database_url_restore
+
+  jwt_secret_key:
+    file: ./secrets/jwt_secret_key
+
+  order_access_secret_key:
+    file: ./secrets/order_access_secret_key
