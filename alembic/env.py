@@ -3,6 +3,7 @@ from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 from sqlalchemy.engine import make_url
+from bladys.config import read_secret
 
 from bladys.models import Base
 
@@ -27,10 +28,10 @@ target_metadata = Base.metadata
 alembic_target = os.getenv("ALEMBIC_TARGET", "development").lower()
 
 if alembic_target in {"development", "dev"}:
-    database_url = os.environ["DATABASE_URL"]
+    database_url = read_secret("DATABASE_URL")
 
 elif alembic_target == "test":
-    database_url = os.environ["TEST_DATABASE_URL"]
+    database_url = read_secret("TEST_DATABASE_URL")
 
 else:
     raise RuntimeError(
