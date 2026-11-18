@@ -62,6 +62,7 @@ def test_concurrent_same_key_and_intent_returns_same_order(
 ):
     """Contexto: dos clientes reintentan simultÃ¡neamente el mismo pedido.
     GarantÃ­a: existe un solo pedido y ambas respuestas autorizan ese pedido.
+    Auditoria: solo el ganador conserva un evento ORDER_CREATED.
     Escenarios: ambas consultas iniciales fallan; una inserciÃ³n gana y la otra recupera.
     """
     from concurrent.futures import ThreadPoolExecutor
@@ -72,7 +73,7 @@ def test_concurrent_same_key_and_intent_returns_same_order(
     from sqlalchemy.orm import Session
 
     from bladys.idempotency import build_request_hash
-    from bladys.models import IdempotencyRecord, OrderItem
+    from bladys.models import AuditEvent, IdempotencyRecord, OrderItem
 
     assert postgres_engine.dialect.name == "postgresql"
     for model in (Order, OrderItem, IdempotencyRecord):
@@ -154,6 +155,13 @@ def test_concurrent_same_key_and_intent_returns_same_order(
         assert record.order_id == order_id
         assert record.key == key
         assert record.request_hash == build_request_hash({postgres_order_variant_id: 2})
+
+        audit = verification_session.scalars(select(AuditEvent)).one()
+        assert audit.event_type == "ORDER_CREATED"
+        assert audit.order_id == order_id
+        assert audit.payment_id is None
+        assert audit.actor_type == "CUSTOMER" and audit.actor_user_id is None
+        assert audit.changes == {"order_status": {"from": None, "to": order.status}}
 
 
 def test_concurrent_cancellation_and_preparation_only_one_wins(

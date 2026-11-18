@@ -3,8 +3,9 @@ from decimal import Decimal
 from enum import StrEnum
 
 from sqlalchemy import (
-    JSON, Boolean, CheckConstraint, DateTime, ForeignKey, Numeric, String, Text, func, true,
+    JSON, BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, Numeric, String, Text, UniqueConstraint, func, text, true,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -140,6 +141,7 @@ class OrderItem(Base):
 class Payment(Base):
     __tablename__ = "payments"
     __table_args__ = (
+        UniqueConstraint("order_id", "id", name="uq_payments_order_id_id"),
         CheckConstraint(
             "status IN ('PENDIENTE_COMPROBANTE', 'PENDIENTE_VERIFICACION', 'APROBADO', 'RECHAZADO')",
             name="ck_payments_status",
@@ -176,4 +178,41 @@ class User(Base):
     role: Mapped[UserRole] = mapped_column(String, nullable=False)
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False,
+    )
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["order_id", "payment_id"], ["payments.order_id", "payments.id"],
+            name="fk_audit_events_order_payment", ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "actor_type IN ('CUSTOMER', 'STAFF', 'SYSTEM')",
+            name="ck_audit_events_actor_type",
+        ),
+        CheckConstraint(
+            "(actor_type = 'STAFF' AND actor_user_id IS NOT NULL) OR "
+            "(actor_type IN ('CUSTOMER', 'SYSTEM') AND actor_user_id IS NULL)",
+            name="ck_audit_events_actor_user",
+        ),
+        Index("ix_audit_events_order_created_id", "order_id", "created_at", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("orders.id", ondelete="RESTRICT"), nullable=False,
+    )
+    payment_id: Mapped[int | None] = mapped_column(nullable=True)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(12), nullable=False)
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=True,
+    )
+    changes: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
     )
