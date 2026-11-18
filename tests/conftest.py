@@ -56,12 +56,34 @@ def variant_factory():
     return create_variant
 
 @pytest.fixture
-def postgres_engine():
-    engine = create_engine(os.environ["TEST_DATABASE_URL"])
+def postgres_engine(monkeypatch):
+    from pathlib import Path
+    from uuid import uuid4
+    from alembic import command
+    from alembic.config import Config
+    from sqlalchemy.schema import CreateSchema, DropSchema
+
+    admin = create_engine(os.environ["TEST_DATABASE_URL"])
+    assert admin.dialect.name == "postgresql"
+    assert admin.url.host in {"localhost", "127.0.0.1", "::1"}
+    assert admin.url.database == "bladys_test"
+    schema = "bladys_test_" + uuid4().hex
+    with admin.begin() as connection:
+        connection.execute(CreateSchema(schema))
+    engine = create_engine(admin.url.update_query_dict({"options": f"-csearch_path={schema}"}))
     try:
+        monkeypatch.setenv("ALEMBIC_TARGET", "test")
+        monkeypatch.setenv("TEST_DATABASE_URL", engine.url.render_as_string(hide_password=False))
+        root = Path(__file__).resolve().parents[1]
+        config = Config(str(root / "alembic.ini"))
+        config.set_main_option("script_location", str(root / "alembic"))
+        command.upgrade(config, "0009")
         yield engine
     finally:
         engine.dispose()
+        with admin.begin() as connection:
+            connection.execute(DropSchema(schema, cascade=True))
+        admin.dispose()
 
 
 @pytest.fixture
@@ -94,6 +116,7 @@ def postgres_client(
 @pytest.fixture
 def clean_postgres_db(postgres_engine):
     tables = """
+        audit_events,
         users,
         payments,
         idempotency_records,
@@ -139,7 +162,17 @@ def engine():
         poolclass=StaticPool,
     )
     try:
-        Base.metadata.create_all(engine)
+        from sqlalchemy import Integer, JSON, MetaData
+
+        # Test-only SQLite DDL: keep real audit inserts, without changing PG metadata.
+        metadata = MetaData()
+        for table in Base.metadata.sorted_tables:
+            table.to_metadata(metadata)
+        audit = metadata.tables["audit_events"]
+        audit.c.id.type = Integer()
+        audit.c.changes.type = JSON()
+        audit.c.changes.server_default = None  # ORM supplies default=dict.
+        metadata.create_all(engine)
         yield engine
     finally:
         engine.dispose()

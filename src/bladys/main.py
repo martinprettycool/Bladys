@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, Header, UploadFile, Form
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, select, update, text
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.exc import IntegrityError
 
 from bladys.payment_proofs import (
@@ -13,12 +14,13 @@ from bladys.payment_proofs import (
     resolve_payment_proof, validate_payment_proofs_storage,
 )
 from bladys.config import validate_signing_secrets
+from bladys.audit import JSONValue, record_audit_event
 from bladys.authentication import authenticate_user
 from bladys.tokens import create_access_token
 from bladys.order_tokens import create_order_access_token
 from bladys.database import get_session
 from bladys.dependencies import get_owned_order, require_role
-from bladys.models import Payment, Order, OrderItem, Product, ProductVariant, IdempotencyRecord, UserRole
+from bladys.models import Payment, Order, OrderItem, Product, ProductVariant, IdempotencyRecord, User, UserRole
 from bladys.schemas import (
     LoginRequest, TokenResponse, KitchenOrderStatusUpdate,
     PaymentDecision, PaymentResponse,
@@ -168,6 +170,11 @@ def create_order(payload: OrderCreate, session: Session = Depends(get_session), 
                 order_id = order.id
             )
             session.add(idempotency_record)
+            record_audit_event(
+                session, order_id=order.id, payment_id=None,
+                event_type="ORDER_CREATED", actor_type="CUSTOMER", actor_user_id=None,
+                changes={"order_status": {"from": None, "to": order.status}},
+            )
             response = build_order_create_response(order)
 
     except IntegrityError:
@@ -230,6 +237,17 @@ def check_unpaid_order(order: Order, payment: Payment | None):
         raise HTTPException(409, detail={"code": "PAYMENT_NOT_EDITABLE", "message": "El pago ya no permite modificar el pedido ni enviar comprobantes"})
 
 
+def audit_order_items(items: list[OrderItem]) -> list[JSONValue]:
+    return [
+        {
+            "variant_id": item.variant_id,
+            "quantity": item.quantity,
+            "selected_flavors": sorted(item.selected_flavors),
+        }
+        for item in sorted(items, key=lambda item: (item.variant_id, sorted(item.selected_flavors)))
+    ]
+
+
 @app.put(
     "/orders/{order_id}/items", response_model=OrderResponse,
     dependencies=[Depends(get_owned_order)],
@@ -246,14 +264,28 @@ def replace_order_items(
         check_order_version(order, payload.expected_version)
 
         items, total = build_order_items(session, normalize_items(payload))
+        previous_version = order.version
+        previous_total = str(order.total)
+        previous_items = audit_order_items(order.items)
         session.execute(delete(OrderItem).where(OrderItem.order_id == order_id))
-        # Explicit deletion is needed: this relationship has no delete-orphan cascade.
-        session.expire(order, ["items"])
+        # The bulk delete bypasses the collection. Reset it before assigning new rows.
+        set_committed_value(order, "items", [])
         order.items = items
         order.total = total
         order.version += 1
         session.flush()
         response = OrderResponse.model_validate(order)
+        record_audit_event(
+            session,
+            order_id=order_id,
+            event_type="ORDER_ITEMS_REPLACED",
+            actor_type="CUSTOMER",
+            changes={
+                "version": {"from": previous_version, "to": order.version},
+                "total": {"from": previous_total, "to": str(order.total)},
+                "items": {"from": previous_items, "to": audit_order_items(order.items)},
+            },
+        )
         session.commit()
     except Exception:
         session.rollback()
@@ -311,6 +343,18 @@ def update_order_status(
     # Ownership lookup has already started the shared session transaction.
     try:
         response = transition_order_status(session, order_id, payload.status)
+        record_audit_event(
+            session,
+            order_id=order_id,
+            event_type="ORDER_STATUS_CHANGED",
+            actor_type="CUSTOMER",
+            actor_user_id=None,
+            payment_id=None,
+            changes={"order_status": {
+                "from": EXPECTED_STATUS[payload.status].value,
+                "to": payload.status.value,
+            }},
+        )
         session.commit()
     except Exception:
         session.rollback()
@@ -320,14 +364,25 @@ def update_order_status(
 
 @app.patch(
     "/kitchen/orders/{order_id}/status", response_model=OrderResponse,
-    dependencies=[Depends(require_role(UserRole.KITCHEN))],
 )
 def update_kitchen_order_status(
     order_id: int, payload: KitchenOrderStatusUpdate,
+    user: User = Depends(require_role(UserRole.KITCHEN)),
     session: Session = Depends(get_session),
 ):
     try:
         response = transition_order_status(session, order_id, payload.status)
+        record_audit_event(
+            session,
+            order_id=order_id,
+            event_type="ORDER_STATUS_CHANGED",
+            actor_type="STAFF",
+            actor_user_id=user.id,
+            changes={"order_status": {
+                "from": EXPECTED_STATUS[payload.status].value,
+                "to": response.status,
+            }},
+        )
         session.commit()
     except Exception:
         session.rollback()
@@ -377,6 +432,7 @@ async def submit_payment_proof(
         order, payment = lock_order_payment(session, order_id)
         check_unpaid_order(order, payment)
         check_order_version(order, expected_version)
+        previous_status = payment.status
         result = session.execute(
             update(Payment).where(
                 Payment.order_id == order_id, Payment.status == "PENDIENTE_COMPROBANTE",
@@ -390,6 +446,14 @@ async def submit_payment_proof(
         if result.rowcount != 1:
             raise HTTPException(409, detail="El pago no permite enviar comprobante")
         response = PaymentResponse.model_validate(payment)
+        record_audit_event(
+            session,
+            order_id=order_id,
+            payment_id=payment.id,
+            event_type="PAYMENT_PROOF_SUBMITTED",
+            actor_type="CUSTOMER",
+            changes={"payment_status": {"from": previous_status, "to": payment.status}},
+        )
         session.commit()
     except Exception:
         try:
@@ -433,11 +497,11 @@ def get_payment_proof(payment_id: int, session: Session = Depends(get_session)):
 
 @app.patch(
     "/payments/{payment_id}/status", response_model=PaymentResponse,
-    dependencies=[Depends(require_role(UserRole.RECEPTION))],
 )
 def decide_payment(
     payment_id: int, payload: PaymentDecision,
     session: Session = Depends(get_session),
+    user: User = Depends(require_role(UserRole.RECEPTION)),
 ):
     try:
         # This lookup takes no row lock. Recheck identity/state after locking.
@@ -447,6 +511,8 @@ def decide_payment(
         order, payment = lock_order_payment(session, order_id)
         if payment is None or payment.id != payment_id:
             raise HTTPException(404, detail="El pago no existe")
+        previous_payment_status = payment.status
+        previous_order_status = order.status
         result = session.execute(
             update(Payment).where(
                 Payment.id == payment_id, Payment.status == "PENDIENTE_VERIFICACION",
@@ -461,6 +527,15 @@ def decide_payment(
         if payload.status == "RECHAZADO":
             session.execute(update(Order).where(Order.id == payment.order_id)
                             .values(status="CANCELADO").execution_options(synchronize_session=False))
+        changes = {"payment_status": {"from": previous_payment_status, "to": payment.status}}
+        if payload.status == "RECHAZADO":
+            session.refresh(order, attribute_names=["status"])
+            changes["order_status"] = {"from": previous_order_status, "to": order.status}
+        record_audit_event(
+            session, order_id=order.id, payment_id=payment.id,
+            event_type="PAYMENT_APPROVED" if payment.status == "APROBADO" else "PAYMENT_REJECTED",
+            actor_type="STAFF", actor_user_id=user.id, changes=changes,
+        )
         response = PaymentResponse.model_validate(payment)
         session.commit()
     except Exception:
